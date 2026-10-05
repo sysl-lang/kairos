@@ -1,0 +1,29 @@
+// An event loop for a microcontroller, shaped like libuv and written for interrupts: numbered
+// sources an interrupt raises, timers on one clock, and idle and check handles.
+//
+// This is the block a *consumer* writes to reach this package:
+//
+//     dependencies {
+//       kairos { git = "github.com/sysl-lang/kairos", version = "0.1.0" }
+//     }
+//
+// The module a program imports is `sh.sysl.kairos`; `sh.sysl.kairos.sim` is the simulated platform
+// the tests run on, and `sh.sysl.kairos.host` the real-time one for a laptop.
+
+package {
+  name    = "kairos"
+  version = "0.1.0"
+  sysl    = "0.0.162"
+}
+
+// **`heap`, because handlers and timers are closures and the tables holding them grow.** Everything
+// on the heap is made while the program registers and schedules -- on the loop's side, never in an
+// interrupt. `signal`, the one function an interrupt calls, touches a single atomic word of module
+// storage and nothing else.
+//
+// **What is NOT here is `os` or `posix`.** The core reads no clock of its own: a `Platform` supplies
+// time and sleep. `sh.sysl.kairos.host` is the one module that asks the operating system for either,
+// and it carries `@requires(posix)` on itself, so a board that never imports it never asks.
+requires {
+  heap = true
+}

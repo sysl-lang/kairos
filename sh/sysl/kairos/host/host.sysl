@@ -1,0 +1,39 @@
+module sh.sysl.kairos.host
+@requires(posix)
+
+import sysl.time.{Duration, millis}
+import sysl.posix.time.{monotonic, sleep}
+import sh.sysl.kairos.{Platform, signalled}
+
+/** A platform over the host's monotonic clock, for demos on a laptop.
+ *
+ * Time is counted from when the platform was made. A host has no interrupts, but `signal` is one
+ * atomic OR and is safe from any thread, so a second thread standing in for a peripheral can raise a
+ * source. Nothing can wake a `nanosleep` when it does, so `idle_until` sleeps in slices of at most a
+ * millisecond and looks at `signalled` between them: a signal is noticed within a millisecond.
+ */
+struct Host
+    private origin: Duration
+
+/** A host platform whose clock starts at zero now. */
+host() -> &Host = Host(monotonic())
+
+private const slice_ms: long = 1
+
+impl Platform for Host
+    now(*self) -> Duration = monotonic() - self.origin
+
+    idle_until(*self, deadline: Option[Duration])
+        loop
+            if signalled() then return
+
+            val slice = millis(slice_ms)
+
+            deadline match
+                Some(d) ->
+                    val left = d - self.now()
+                    if left <= millis(0) then return
+                    sleep(if left < slice then left else slice)
+                None -> sleep(slice)
+    end idle_until
+end Host

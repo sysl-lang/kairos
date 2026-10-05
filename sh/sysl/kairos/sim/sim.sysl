@@ -1,0 +1,104 @@
+module sh.sysl.kairos.sim
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, micros}
+import sh.sysl.kairos.{Platform, signal, signalled}
+
+/** A platform with a clock that moves only when it is told to, for tests.
+ *
+ * `idle_until` is where time passes: it jumps the clock to the deadline, or to the first interrupt
+ * scheduled before it, raises that interrupt's source with `signal` exactly as an interrupt handler
+ * would, and returns. Nothing sleeps, so a suite over a minute of simulated time runs in a moment and
+ * answers the same every time.
+ *
+ * Every call to `idle_until` is recorded in `waits`, which is how a test asserts the contract a board
+ * relies on: no deadline when only sources are registered, the nearest timer otherwise.
+ */
+struct Sim
+    private clock: Duration
+    private reads: usize
+    private irqs: Buf[Irq]
+    private calls: Buf[Option[Duration]]
+
+    /** Schedule an interrupt raising source `n` at simulated time `at`. Several at one time are
+     * delivered together, by one wake.
+     */
+    irq_at(*self, at: Duration, n: u32)
+        self.irqs.push(Irq(at, n))
+
+    /** Move the clock on by `d` without waiting: the time a callback takes to run. */
+    advance(*self, d: Duration)
+        self.clock = self.clock + d
+
+    /** The deadline of every `idle_until` call so far, in order. */
+    waits(self) -> []Option[Duration] = self.calls.view()
+
+    /** Interrupts scheduled and not yet delivered. */
+    queued(self) -> usize = self.irqs.len()
+
+    private earliest(self) -> Option[Duration]
+        var best: Option[Duration] = None
+
+        for i in 0..<self.irqs.len()
+            val t = self.irqs[i].at
+            best = best match
+                Some(b) -> if t < b then Some(t) else best
+                None -> Some(t)
+
+        best
+    end earliest
+
+    private deliver(*self, t: Duration)
+        var i: usize = 0
+
+        while i < self.irqs.len()
+            if self.irqs[i].at == t
+                signal(self.irqs.remove(i).n)
+            else
+                i += 1
+    end deliver
+end Sim
+
+private struct Irq
+    at: Duration
+    n: u32
+
+/** A simulated platform at time zero, with nothing scheduled. */
+sim() -> &Sim = Sim(micros(0), 0, buf(), buf())
+
+/** How many times the clock may be read before the simulation calls it a hang. The loop reads it at
+ * least once a pass, so a defect that keeps the loop spinning without ever waiting -- a source never
+ * cleared, a handle that never gets to stop it -- fails a test instead of running for ever.
+ */
+private const max_reads: usize = 100000
+
+impl Platform for Sim
+    now(*self) -> Duration
+        self.reads += 1
+        if self.reads > max_reads then panic(s"the loop has read the clock $max_reads times: it is spinning")
+        self.clock
+
+    idle_until(*self, deadline: Option[Duration])
+        self.calls.push(deadline)
+
+        if signalled() then return
+
+        val first = self.earliest()
+
+        val wake = first match
+            Some(t) ->
+                deadline match
+                    Some(d) -> if d < t then None else first
+                    None -> first
+            None -> None
+
+        wake match
+            Some(t) ->
+                if t > self.clock then self.clock = t
+                self.deliver(t)
+            None ->
+                deadline match
+                    Some(d) -> if d > self.clock then self.clock = d
+                    None -> panic("the loop would sleep forever: no deadline and no interrupt scheduled")
+    end idle_until
+end Sim

@@ -1,0 +1,476 @@
+module sh.sysl.kairos.sim
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, millis, whole_micros}
+import sh.sysl.kairos.{Loop, Timer, Handle, SourceError, event_loop, signal, signalled, OutOfRange, Taken}
+
+/** The loop on the simulated platform.
+ *
+ * **Every timeline here is asserted whole**, as the list of what ran and when, so a defect that moves
+ * one event shows up as a disagreement rather than as a count that still happens to match. Time is
+ * written in whole milliseconds. Each test starts by asserting no source is left raised, because
+ * the pending word is module storage and one test leaking a bit into the next is exactly the kind of
+ * defect it would otherwise hide.
+ */
+
+private ms(lp: *Loop) -> long = whole_micros(lp.now()) / 1000
+
+// Every deadline `idle_until` was called with, in milliseconds; a wait with no deadline is `forever`.
+private const forever: long = -1
+
+private waits(s: &Sim) -> Buf[long]
+    var out: Buf[long] = buf()
+
+    for w in s.waits()
+        out.push(w match
+            Some(d) -> whole_micros(d) / 1000
+            None -> forever)
+
+    out
+end waits
+
+private answer(r: Result[unit, SourceError]) -> string = r match
+    Ok(_) -> "ok"
+    Err(OutOfRange(n)) -> s"out of range $n"
+    Err(Taken(n)) -> s"taken $n"
+
+// ---- sources ------------------------------------------------------------------------------------
+
+@test("a signal raised by a simulated interrupt runs its handler once, at the interrupt's time")
+interrupt_runs_handler_once()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val at: &Buf[long] = buf()
+
+    s.irq_at(millis(5), 3)
+    assert(lp.on(3, (l) -> at.push(ms(l))).is_ok())
+    lp.after(millis(20), (l) -> l.stop())
+    lp.run()
+
+    assert_eq(at.view(), [5])
+    assert_eq(waits(s).view(), [20, 20])
+    assert_eq(s.queued(), 0)
+end interrupt_runs_handler_once
+
+@test("two signals on one source before a pass run its handler once, because a source is a bit")
+two_signals_one_pass()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val at: &Buf[long] = buf()
+
+    signal(2)
+    signal(2)
+    s.irq_at(millis(5), 2)
+    s.irq_at(millis(5), 2)
+    lp.on(2, (l) -> at.push(ms(l)))
+    lp.after(millis(9), (l) -> l.off(2))
+    lp.run()
+
+    assert_eq(at.view(), [0, 5])
+    assert(!signalled())
+end two_signals_one_pass
+
+@test("signals on different sources run both handlers in one pass, lowest source first")
+signals_on_two_sources()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[(u32, long)] = buf()
+
+    s.irq_at(millis(4), 7)
+    s.irq_at(millis(4), 1)
+    s.irq_at(millis(6), 7)
+    lp.on(7, (l) -> log.push((7, ms(l))))
+    lp.on(1, (l) -> log.push((1, ms(l))))
+    lp.after(millis(10), (l) -> l.stop())
+    lp.run()
+
+    assert_eq(log.view(), [(1, 4), (7, 4), (7, 6)])
+end signals_on_two_sources
+
+@test("a handler that raises its own source again runs on the next pass, without the loop sleeping")
+signal_from_handler()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val count: &Buf[long] = buf()
+
+    s.irq_at(millis(3), 0)
+    lp.on(0, (l) ->
+        count.push(ms(l))
+        if count.len() < 3 then signal(0) else l.off(0))
+    lp.run()
+
+    assert_eq(count.view(), [3, 3, 3])
+    assert_eq(waits(s).view(), [forever])
+end signal_from_handler
+
+@test("a source number outside 0..<32 is refused by on, and ignored by signal")
+source_out_of_range()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+
+    assert_eq(answer(lp.on(32, (l) -> ())), "out of range 32")
+    assert_eq(answer(lp.on(1000, (l) -> ())), "out of range 1000")
+    assert(lp.on(31, (l) -> ()).is_ok())
+    assert(!lp.off(32))
+
+    signal(32)
+    signal(4000000000)
+    assert(!signalled())
+
+    assert(lp.off(31))
+    lp.run()
+    assert_eq(s.waits().len, 0)
+end source_out_of_range
+
+@test("a second handler for one source is refused and the first one stays; off frees the source")
+second_handler_refused()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    assert(lp.on(5, (l) -> log.push("first")).is_ok())
+    assert_eq(answer(lp.on(5, (l) -> log.push("second"))), "taken 5")
+
+    s.irq_at(millis(1), 5)
+    s.irq_at(millis(3), 5)
+    lp.after(millis(2), (l) ->
+        l.off(5)
+        l.on(5, (m) -> log.push("third")))
+    lp.after(millis(4), (l) -> l.off(5))
+    lp.run()
+
+    assert_eq(log.view(), ["first", "third"])
+    assert(!lp.off(5))
+end second_handler_refused
+
+// ---- timers -------------------------------------------------------------------------------------
+
+@test("timers added out of order fire in deadline order, each at its deadline")
+timers_in_deadline_order()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[(string, long)] = buf()
+
+    lp.after(millis(30), (l) -> log.push(("c", ms(l))))
+    lp.after(millis(10), (l) -> log.push(("a", ms(l))))
+    lp.after(millis(25), (l) -> log.push(("b2", ms(l))))
+    lp.after(millis(20), (l) -> log.push(("b", ms(l))))
+    lp.run()
+
+    assert_eq(log.view(), [("a", 10), ("b", 20), ("b2", 25), ("c", 30)])
+    assert_eq(waits(s).view(), [10, 20, 25, 30])
+end timers_in_deadline_order
+
+@test("timers added from inside a callback take their place in the deadline order")
+timers_added_from_callback()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[(string, long)] = buf()
+
+    lp.after(millis(12), (l) -> log.push(("existing", ms(l))))
+    lp.after(millis(10), (l) ->
+        log.push(("first", ms(l)))
+        l.after(millis(5), (m) -> log.push(("plus five", ms(m))))
+        l.after(millis(0), (m) -> log.push(("plus zero", ms(m))))
+        l.after(millis(1), (m) -> log.push(("plus one", ms(m)))))
+    lp.run()
+
+    assert_eq(log.view(), [("first", 10), ("plus zero", 10), ("plus one", 11), ("existing", 12), ("plus five", 15)])
+end timers_added_from_callback
+
+@test("timers due at the same moment fire in the order they were set")
+equal_deadlines_are_fifo()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[int] = buf()
+
+    for i in 0..<6
+        lp.after(millis(10), (l) -> log.push(i))
+
+    lp.after(millis(5), (l) ->
+        l.after(millis(5), (m) -> log.push(6))
+        l.after(millis(5), (m) -> log.push(7)))
+    lp.run()
+
+    assert_eq(log.view(), [0, 1, 2, 3, 4, 5, 6, 7])
+    assert_eq(waits(s).view(), [5, 10])
+end equal_deadlines_are_fifo
+
+@test("a repeating timer fires at exact multiples of its period, even after a late pass")
+repeating_at_exact_multiples()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val at: &Buf[long] = buf()
+
+    // A callback at 5 that takes 8 ms makes the pass after it start at 13, late for the 10.
+    lp.after(millis(5), (l) -> s.advance(millis(8)))
+    lp.every(millis(10), (l) ->
+        at.push(ms(l))
+        if at.len() == 4 then l.stop())
+    lp.run()
+
+    assert_eq(at.view(), [13, 20, 30, 40])
+    assert_eq(waits(s).view(), [5, 20, 30, 40])
+end repeating_at_exact_multiples
+
+@test("a stopped run resumes where it left off when run again")
+run_again_after_stop()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val at: &Buf[long] = buf()
+
+    val t = lp.every(millis(7), (l) ->
+        at.push(ms(l))
+        if at.len() == 2 then l.stop())
+    lp.run()
+    assert_eq(at.view(), [7, 14])
+
+    lp.after(millis(10), (l) -> l.stop())
+    lp.run()
+    assert_eq(at.view(), [7, 14, 21])
+
+    assert(lp.cancel(t))
+    lp.run()
+    assert_eq(at.view(), [7, 14, 21])
+end run_again_after_stop
+
+@test("a cancelled timer never fires, and cancelling answers whether it was still pending")
+cancel_before_run()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    val a = lp.after(millis(10), (l) -> log.push("a"))
+    val b = lp.after(millis(20), (l) -> log.push("b"))
+
+    assert(lp.cancel(a))
+    assert(!lp.cancel(a))
+    lp.run()
+
+    assert_eq(log.view(), ["b"])
+    assert(!lp.cancel(b))
+    assert_eq(waits(s).view(), [20])
+end cancel_before_run
+
+@test("a timer cancelled from another's callback does not fire, even when due at the same moment")
+cancel_from_callback()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[string] = buf()
+    val victims: &Buf[Timer] = buf()
+
+    lp.after(millis(10), (l) ->
+        log.push("killer")
+        for i in 0..<victims.len()
+            assert(l.cancel(victims[i])))
+    victims.push(lp.after(millis(10), (l) -> log.push("same moment")))
+    victims.push(lp.after(millis(20), (l) -> log.push("later")))
+    victims.push(lp.every(millis(3), (l) -> log.push("tick")))
+    lp.run()
+
+    assert_eq(log.view(), ["tick", "tick", "tick", "killer"])
+    assert_eq(waits(s).view(), [3, 6, 9, 10])
+end cancel_from_callback
+
+@test("a repeating timer may cancel itself, and the slot it frees is not confused with the next")
+cancel_self_and_reuse()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[(string, long)] = buf()
+    val me: &Buf[Timer] = buf()
+
+    me.push(lp.every(millis(4), (l) ->
+        log.push(("tick", ms(l)))
+        if log.len() == 3 then assert(l.cancel(me[0]))))
+    lp.run()
+
+    // The freed slot is reused by the next timer; the old Timer must not reach it.
+    val fresh = lp.after(millis(1), (l) -> log.push(("fresh", ms(l))))
+    assert(!lp.cancel(me[0]))
+    lp.run()
+
+    assert_eq(log.view(), [("tick", 4), ("tick", 8), ("tick", 12), ("fresh", 13)])
+    assert(!lp.cancel(fresh))
+end cancel_self_and_reuse
+
+// ---- idle and check handles ---------------------------------------------------------------------
+
+@test("one pass runs timers, then idle handles, then sources, then check handles")
+pass_order()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    signal(9)
+    lp.on(9, (l) -> log.push("source"))
+    lp.check((l) ->
+        log.push("check")
+        if log.len() > 4 then l.stop())
+    val i = lp.idle((l) -> log.push("idle"))
+    lp.after(millis(0), (l) -> log.push("timer"))
+    lp.run()
+
+    assert_eq(log.view(), ["timer", "idle", "source", "check", "idle", "check"])
+    assert(lp.remove(i))
+end pass_order
+
+@test("check handles run on every pass, and a handle removed mid-pass does not run again")
+check_handles_every_pass()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[(string, long)] = buf()
+    val handles: &Buf[Handle] = buf()
+
+    handles.push(lp.check((l) ->
+        log.push(("a", ms(l)))
+        if ms(l) == 10 then assert(l.remove(handles[1]))
+        if ms(l) == 20 then assert(l.remove(handles[0]))))
+    handles.push(lp.check((l) -> log.push(("b", ms(l)))))
+    handles.push(lp.check((l) -> log.push(("c", ms(l)))))
+    lp.every(millis(10), (l) -> if ms(l) == 30 then l.stop())
+    lp.run()
+
+    assert_eq(log.view(), [("a", 0), ("b", 0), ("c", 0), ("a", 10), ("c", 10), ("a", 20), ("c", 20), ("c", 30)])
+    assert(!lp.remove(handles[0]))
+    assert(!lp.remove(handles[1]))
+    assert(lp.remove(handles[2]))
+    assert_eq(waits(s).view(), [10, 20, 30])
+end check_handles_every_pass
+
+@test("an idle handle runs on every pass and keeps the loop from sleeping until it is removed")
+idle_handle_keeps_loop_awake()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val runs: &Buf[long] = buf()
+    val me: &Buf[Handle] = buf()
+
+    me.push(lp.idle((l) ->
+        runs.push(ms(l))
+        if runs.len() == 4 then assert(l.remove(me[0]))))
+    lp.after(millis(10), (l) -> runs.push(-ms(l)))
+    lp.run()
+
+    assert_eq(runs.view(), [0, 0, 0, 0, -10])
+    assert_eq(waits(s).view(), [10])
+end idle_handle_keeps_loop_awake
+
+// ---- run, stop and the wait contract ------------------------------------------------------------
+
+@test("run returns at once when nothing is registered, without waiting")
+run_with_nothing()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+
+    lp.run()
+    assert_eq(s.waits().len, 0)
+end run_with_nothing
+
+@test("run returns when the last timer has fired")
+run_returns_when_timers_done()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[long] = buf()
+
+    lp.after(millis(10), (l) -> log.push(ms(l)))
+    lp.run()
+
+    assert_eq(log.view(), [10])
+    assert_eq(waits(s).view(), [10])
+    assert_eq(whole_micros(s.now()), 10000)
+end run_returns_when_timers_done
+
+@test("stop returns from run early, with a source and a timer still registered")
+stop_returns_early()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[long] = buf()
+
+    lp.on(0, (l) -> log.push(ms(l)))
+    lp.every(millis(5), (l) -> log.push(-ms(l)))
+    s.irq_at(millis(7), 0)
+    s.irq_at(millis(12), 0)
+    s.irq_at(millis(13), 0)
+    lp.after(millis(12), (l) -> l.stop())
+    lp.run()
+
+    assert_eq(log.view(), [-5, 7, -10, 12])
+    assert_eq(s.queued(), 1)
+
+    s.irq_at(millis(1000), 0)
+    lp.off(0)
+    lp.after(millis(1), (l) -> l.stop())
+    lp.run()
+    assert(!signalled())
+end stop_returns_early
+
+@test("with only sources registered, the loop waits with no deadline")
+wait_without_deadline()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[long] = buf()
+
+    lp.on(4, (l) ->
+        log.push(ms(l))
+        if log.len() == 2 then l.off(4))
+    s.irq_at(millis(100), 4)
+    s.irq_at(millis(250), 4)
+    lp.run()
+
+    assert_eq(log.view(), [100, 250])
+    assert_eq(waits(s).view(), [forever, forever])
+end wait_without_deadline
+
+@test("the wait's deadline is the nearest live timer, not a cancelled one")
+wait_for_nearest_live_timer()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+
+    lp.on(4, (l) -> ())
+    val near = lp.after(millis(10), (l) -> ())
+    lp.after(millis(40), (l) -> l.off(4))
+    lp.after(millis(25), (l) -> ())
+    lp.after(millis(30), (l) -> ())
+    assert(lp.cancel(near))
+    s.irq_at(millis(27), 4)
+    lp.run()
+
+    assert_eq(waits(s).view(), [25, 30, 30, 40])
+end wait_for_nearest_live_timer
+
+@test("the loop does not wait when a timer is already due by the time the pass ends")
+no_wait_when_already_due()
+    assert(!signalled())
+    val s = sim()
+    var lp = event_loop(s)
+    val log: &Buf[long] = buf()
+
+    lp.after(millis(5), (l) -> s.advance(millis(20)))
+    lp.after(millis(10), (l) -> log.push(ms(l)))
+    lp.run()
+
+    assert_eq(log.view(), [25])
+    assert_eq(waits(s).view(), [5])
+end no_wait_when_already_due

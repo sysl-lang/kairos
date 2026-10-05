@@ -1,0 +1,335 @@
+module sh.sysl.kairos
+
+import sysl.sync.Atomic
+import sysl.buf.{Buf, buf}
+import sysl.container.{Heap, heap}
+import sysl.time.Duration
+
+/** An event loop for a machine with interrupts and nothing else: numbered sources an interrupt
+ * raises, timers on one clock, and closures that run on every pass.
+ *
+ * **Two halves, and only one of them may run in an interrupt.** `signal` is the whole of the
+ * interrupt half: one atomic OR into a word of module storage, no allocation, no closure, nothing
+ * that can block. Everything else -- the handlers, the timers, the handles -- lives on a `Loop` the
+ * program builds in `main`, and runs on the loop's own stack when `run` drains what the interrupts
+ * left behind.
+ */
+
+/** How many sources there are: one per bit of the pending word. */
+const max_sources: u32 = 32
+
+/** The interrupt half's whole state. Zero at reset, so it lands in `.bss` and needs no constructor --
+ * which is what lets an interrupt fire before `main` has built anything without reading garbage.
+ */
+private var pending: Atomic[u32] = Atomic(0)
+
+/** Raise source `n`: the one thing an interrupt handler calls.
+ *
+ * It sets one bit and returns. Raising a source twice before the loop gets to it is raising it once,
+ * because a source is a bit and not a queue -- a handler drains whatever its hardware has buffered,
+ * not one item per call. A number outside `0..<max_sources` is ignored rather than refused, because
+ * an interrupt has nobody to refuse it to; `Loop.on` is where an out-of-range number is caught.
+ */
+signal(n: u32)
+    if n < max_sources
+        pending.or(1 << n)
+
+/** Whether any source is raised and not yet drained.
+ *
+ * **This is what a `Platform.idle_until` checks before it sleeps**, with interrupts masked, so that a
+ * signal landing between the loop's last look and the sleep instruction wakes it rather than waiting
+ * for the next one. On a Cortex-M that is `cpsid i`, this, `wfi`, `cpsie i`: WFI wakes on a pending
+ * interrupt even while interrupts are masked.
+ */
+signalled() -> bool = pending.load() != 0
+
+/** Where the loop's time comes from and how it waits. One implementation per machine.
+ *
+ * Time is a `Duration` from an origin the platform chooses -- boot, on a board -- and never goes
+ * backwards.
+ *
+ * `idle_until` waits until the deadline or until something is signalled, whichever is first, and it
+ * may return early for any reason at all: the loop looks at the clock again and carries on. `None`
+ * means there is no timer, so only a signal can give the loop anything to do. A board implements it
+ * as WFI with SysTick, or a one-shot timer compare, set for the deadline; it must return at once if
+ * `signalled()` is already true.
+ */
+trait Platform
+    now(*self) -> Duration
+    idle_until(*self, deadline: Option[Duration])
+
+/** Everything the loop calls back is handed the loop, so a callback can add a timer or stop the loop
+ * without capturing the loop it is registered on.
+ */
+type Callback = &Fn(*Loop) -> unit
+
+/** Why `Loop.on` refused a source. */
+enum SourceError
+    OutOfRange(n: u32)
+    Taken(n: u32)
+
+/** A timer, as `after` and `every` answer it: the thing `cancel` takes. */
+struct Timer
+    private slot: u32
+    private gen: u32
+
+/** An idle or check handle, as `idle` and `check` answer it: the thing `remove` takes. */
+struct Handle
+    private idle: bool
+    private slot: u32
+    private gen: u32
+
+/** A table of entries addressed by slot and generation, so a stale `Timer` or `Handle` -- one already
+ * fired, cancelled or removed -- finds nothing rather than whatever reused its slot.
+ */
+private struct Slot[T]
+    gen: u32
+    item: Option[T]
+
+private struct Slots[T]
+    entries: Buf[Slot[T]]
+    free: Buf[u32]
+    live: usize
+
+    add(*self, item: T) -> (u32, u32)
+        self.live += 1
+
+        self.free.pop() match
+            Some(i) ->
+                val gen = self.entries[usize(i)].gen + 1
+                self.entries[usize(i)] = Slot(gen, Some(item))
+                (i, gen)
+            None ->
+                self.entries.push(Slot(0, Some(item)))
+                (u32(self.entries.len() - 1), 0)
+    end add
+
+    get(self, i: u32, gen: u32) -> Option[T]
+        if usize(i) >= self.entries.len() then return None
+
+        val e = self.entries[usize(i)]
+        if e.gen == gen then e.item else None
+
+    remove(*self, i: u32, gen: u32) -> bool
+        if self.get(i, gen).is_none() then return false
+
+        self.entries[usize(i)] = Slot(gen, None)
+        self.free.push(i)
+        self.live -= 1
+        true
+    end remove
+end Slots
+
+private slots[T]() -> Slots[T] = Slots(buf(), buf(), 0)
+
+/** A timer's state; its place in the deadline order is a `Due` in the queue. */
+private struct TimerState
+    cb: Callback
+    period: Option[Duration]
+
+/** One entry of the deadline queue. Ordered by deadline, then by the order entries were queued, so
+ * two timers due at the same moment fire in the order they were set.
+ */
+private struct Due
+    at: Duration
+    seq: u64
+    slot: u32
+    gen: u32
+
+impl Eq for Due
+    eq(self, rhs: Due) -> bool = self.at == rhs.at && self.seq == rhs.seq
+
+impl Ord for Due
+    lt(self, rhs: Due) -> bool = self.at < rhs.at || (self.at == rhs.at && self.seq < rhs.seq)
+
+/** The loop. Build one in `main`, register what it should do, and `run` it.
+ *
+ * Each pass of `run`, in order:
+ *
+ * 1. reads the platform's clock once; every timer set during the pass is set from that reading;
+ * 2. fires the timers that were due at that reading, earliest first;
+ * 3. runs the idle handles;
+ * 4. drains the pending sources, and runs the handler of each raised one;
+ * 5. runs the check handles;
+ * 6. returns if `stop` was called or nothing is left, and otherwise waits: not at all if an idle
+ *    handle exists, a timer is already due or a source is raised; else `idle_until` the nearest
+ *    timer, or `idle_until(None)` if there is none.
+ */
+struct Loop
+    private platform: &Platform
+    private handlers: [32]Option[Callback]
+    private registered: u32
+    private timers: Slots[TimerState]
+    private queue: Heap[Due]
+    private seq: u64
+    private idles: Slots[Callback]
+    private checks: Slots[Callback]
+    private time: Duration
+    private stopping: bool
+
+    /** The time this pass started, as the platform read it. */
+    now(self) -> Duration = self.time
+
+    /** Handle source `n` with `cb` on every pass where it was raised.
+     *
+     * A source has one handler: a second `on` for the same number is refused with `Taken`, and the
+     * first one stays. `off` frees it.
+     */
+    on(*self, n: u32, cb: Callback) -> Result[unit, SourceError]
+        if n >= max_sources then return Err(OutOfRange(n))
+        if (self.registered & (1 << n)) != 0 then return Err(Taken(n))
+
+        self.handlers[usize(n)] = Some(cb)
+        self.registered |= 1 << n
+        Ok(())
+    end on
+
+    /** Stop handling source `n`. Answers whether it had a handler. */
+    off(*self, n: u32) -> bool
+        if n >= max_sources || (self.registered & (1 << n)) == 0 then return false
+
+        self.handlers[usize(n)] = None
+        self.registered &= ~(1 << n)
+        true
+    end off
+
+    /** Call `cb` once, `delay` from the start of this pass. */
+    after(*self, delay: Duration, cb: Callback) -> Timer = self.schedule(delay, None, cb)
+
+    /** Call `cb` every `period`, the first time `period` from the start of this pass.
+     *
+     * The deadlines are exact multiples of `period` from the first: a pass that runs late does not
+     * push the next deadline back. A period of zero fires once a pass.
+     */
+    every(*self, period: Duration, cb: Callback) -> Timer = self.schedule(period, Some(period), cb)
+
+    /** Cancel a timer. Answers whether it was still pending; a one-shot that has fired, or a timer
+     * already cancelled, answers false. A timer may cancel itself, or any other, from a callback.
+     */
+    cancel(*self, t: Timer) -> bool = self.timers.remove(t.slot, t.gen)
+
+    /** Run `cb` on every pass, and never sleep while it exists: for work that must be polled as fast
+     * as the machine allows.
+     */
+    idle(*self, cb: Callback) -> Handle
+        val (slot, gen) = self.idles.add(cb)
+        Handle(true, slot, gen)
+
+    /** Run `cb` on every pass, after the sources are drained, and sleep as usual: for a library that
+     * must be polled after anything happens -- TinyUSB's `tud_task`, LVGL's timer handler.
+     */
+    check(*self, cb: Callback) -> Handle
+        val (slot, gen) = self.checks.add(cb)
+        Handle(false, slot, gen)
+
+    /** Remove an idle or check handle. Answers whether it was still there. */
+    remove(*self, h: Handle) -> bool =
+        if h.idle then self.idles.remove(h.slot, h.gen) else self.checks.remove(h.slot, h.gen)
+
+    /** Make `run` return at the end of the current pass. */
+    stop(*self)
+        self.stopping = true
+
+    /** Whether anything is left that could ever run: a timer, a handle or a source. */
+    alive(self) -> bool =
+        self.registered != 0 || self.timers.live > 0 || self.idles.live > 0 || self.checks.live > 0
+
+    /** Run passes until `stop` is called or nothing is left. */
+    run(*self)
+        self.stopping = false
+
+        while self.alive()
+            self.time = self.platform.now()
+            self.fire_timers()
+            self.run_handles(true)
+            self.drain()
+            self.run_handles(false)
+
+            if self.stopping || !self.alive() then break
+
+            self.wait()
+
+        self.stopping = false
+    end run
+
+    private schedule(*self, delay: Duration, period: Option[Duration], cb: Callback) -> Timer
+        val (slot, gen) = self.timers.add(TimerState(cb, period))
+        self.enqueue(self.time + delay, slot, gen)
+        Timer(slot, gen)
+
+    private enqueue(*self, at: Duration, slot: u32, gen: u32)
+        self.queue.push(Due(at, self.seq, slot, gen))
+        self.seq += 1
+
+    /** Fire what was due at this pass's reading. A timer set during the pass waits for the next one,
+     * even at a delay of zero, so a callback that sets one cannot keep a pass from ending.
+     */
+    private fire_timers(*self)
+        val mark = self.seq
+
+        loop
+            val due = self.queue.peek() match
+                Some(d) -> d
+                None -> return
+
+            if due.at > self.time || due.seq >= mark then return
+
+            self.queue.pop()
+
+            self.timers.get(due.slot, due.gen) match
+                Some(t) ->
+                    t.period match
+                        Some(p) -> self.enqueue(due.at + p, due.slot, due.gen)
+                        None -> self.timers.remove(due.slot, due.gen)
+
+                    t.cb(self)
+                None -> ()
+    end fire_timers
+
+    /** The nearest live deadline, dropping cancelled entries off the front of the queue on the way. */
+    private next_deadline(*self) -> Option[Duration]
+        loop
+            val due = self.queue.peek() match
+                Some(d) -> d
+                None -> return None
+
+            if self.timers.get(due.slot, due.gen).is_some() then return Some(due.at)
+
+            self.queue.pop()
+    end next_deadline
+
+    private run_handles(*self, idle: bool)
+        val n = if idle then self.idles.entries.len() else self.checks.entries.len()
+
+        for i in 0..<n
+            val e = if idle then self.idles.entries[i] else self.checks.entries[i]
+
+            e.item match
+                Some(cb) -> cb(self)
+                None -> ()
+    end run_handles
+
+    private drain(*self)
+        val raised = pending.swap(0)
+
+        for n in 0..<max_sources
+            if (raised & (1 << n)) != 0
+                self.handlers[usize(n)] match
+                    Some(cb) -> cb(self)
+                    None -> ()
+    end drain
+
+    private wait(*self)
+        if self.idles.live > 0 || signalled() then return
+
+        val deadline = self.next_deadline()
+
+        deadline match
+            Some(d) -> if d > self.platform.now() then self.platform.idle_until(deadline)
+            None -> self.platform.idle_until(None)
+    end wait
+end Loop
+
+/** A loop over `platform`, with nothing registered. */
+event_loop(platform: &Platform) -> Loop =
+    Loop(platform, [None; 32], 0, slots(), heap(), 0, slots(), slots(), platform.now(), false)
