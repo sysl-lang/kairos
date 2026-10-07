@@ -3,11 +3,11 @@ module sh.sysl.kairos.host
 
 import sysl.time.{Duration, millis}
 import sysl.posix.time.{monotonic, sleep}
-import sh.sysl.kairos.{Platform, signalled}
+import sh.sysl.kairos.{Driver, signalled}
 
-/** A platform over the host's monotonic clock, for demos on a laptop.
+/** A driver over the host's monotonic clock, for demos on a laptop.
  *
- * Time is counted from when the platform was made. A host has no interrupts, but `signal` is one
+ * Time is counted from when the driver was made. A host has no interrupts, but `signal` is one
  * atomic OR and is safe from any thread, so a second thread standing in for a peripheral can raise a
  * source. Nothing can wake a `nanosleep` when it does, so `idle_until` sleeps in slices of at most a
  * millisecond and looks at `signalled` between them: a signal is noticed within a millisecond.
@@ -15,12 +15,12 @@ import sh.sysl.kairos.{Platform, signalled}
 struct Host
     private origin: Duration
 
-/** A host platform whose clock starts at zero now. */
+/** A host driver whose clock starts at zero now. */
 host() -> &Host = Host(monotonic())
 
 private const slice_ms: long = 1
 
-impl Platform for Host
+impl Driver for Host
     now(*self) -> Duration = monotonic() - self.origin
 
     idle_until(*self, deadline: Option[Duration])

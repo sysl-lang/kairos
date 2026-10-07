@@ -1,0 +1,104 @@
+module sh.sysl.kairos
+
+import sysl.time.Duration
+
+// The tasks behind `Loop.sleep`, `Loop.wait_for`, `Loop.timeout` and `Loop.block_on`.
+//
+// **Every waker is kept where the event it waits for will find it**: a timer's callback, a source's
+// handler. And every one of these tasks gives back what it registered in a `defer`, so a task
+// dropped while it waits -- cancelled -- leaves no timer or handler behind to keep the loop alive.
+
+/** One event, and the waker of the task waiting for it.
+ *
+ * The event calls `fire`; the task's `park` calls `arm`. Whichever runs second wakes the task, so an
+ * event that happens before the task parks is not lost.
+ */
+private struct Latch
+    fired: bool
+    waiter: Option[&Fn() -> unit]
+
+    fire(*self)
+        self.fired = true
+
+        self.waiter match
+            Some(w) ->
+                self.waiter = None
+                w()
+            None -> ()
+    end fire
+
+    arm(*self, w: &Fn() -> unit)
+        if self.fired then w() else self.waiter = Some(w)
+
+private latch() -> &Latch = Latch(false, None)
+
+private[kairos] async sleep_on[D: Driver](lp: &Loop[D], d: Duration)
+    val done = latch()
+    val t = lp.after(d, (l) -> done.fire())
+    defer lp.cancel(t)
+
+    await park((w) -> done.arm(w))
+
+private[kairos] async wait_on[D: Driver](lp: &Loop[D], n: u32) -> Result[unit, SourceError]
+    val raised = latch()
+
+    lp.on(n, (l) -> raised.fire())?
+    defer lp.off(n)
+
+    await park((w) -> raised.arm(w))
+    Ok(())
+
+/** A timeout's two events: the task it runs was woken, or the deadline passed. */
+private struct Race
+    woken: bool
+    expired: bool
+    waiter: Option[&Fn() -> unit]
+
+    wake(*self)
+        self.woken = true
+        self.call()
+
+    expire(*self)
+        self.expired = true
+        self.call()
+
+    arm(*self, w: &Fn() -> unit)
+        if self.woken || self.expired then w() else self.waiter = Some(w)
+
+    private call(*self)
+        self.waiter match
+            Some(w) ->
+                self.waiter = None
+                w()
+            None -> ()
+end Race
+
+/** Step `t` on a waker of this task's own, and only when that waker was called -- a step of a park
+ * nothing woke resumes nothing, so it would be a step wasted. The deadline is looked at only after
+ * the step, which is what lets a task that finishes in the pass its deadline falls due win.
+ */
+private[kairos] async timeout_on[T, D: Driver](lp: &Loop[D], d: Duration, t: Task[T]) -> Option[T]
+    val out: &Outcome[T] = outcome()
+    val inner = fill(t, out)
+    val race: &Race = Race(true, false, None)
+    val timer = lp.after(d, (l) -> race.expire())
+    defer lp.cancel(timer)
+
+    loop
+        if race.woken
+            race.woken = false
+            if step(inner, () -> race.wake()) then return out.value
+
+        if race.expired then return None
+
+        await park((w) -> race.arm(w))
+end timeout_on
+
+/** Where a task's result is left by `fill`, the task that awaits it. */
+private[kairos] struct Outcome[T]
+    value: Option[T]
+
+private[kairos] outcome[T]() -> &Outcome[T] = Outcome(None)
+
+private[kairos] async fill[T](t: Task[T], out: &Outcome[T])
+    out.value = Some(await t)

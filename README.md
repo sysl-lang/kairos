@@ -2,7 +2,8 @@
 
 An event loop for sysl, written for a microcontroller first: numbered sources an interrupt raises,
 timers on one clock, and idle and check handles — libuv's shape, in callback form, with nothing in
-it a bare Cortex-M cannot run.
+it a bare Cortex-M cannot run. The same loop is an async executor: tasks spawned on it sleep on its
+timers and wait on its sources.
 
 *Kairos* is Greek for the opportune moment: not the time on the clock, but the right time to act.
 
@@ -51,24 +52,24 @@ passes: 5
 | | |
 |---|---|
 | `signal(n)` | raise source `n` (0–31). **The one function an interrupt calls.** |
-| `signalled()` | whether a source is raised and not yet drained — for a `Platform` to check before it sleeps |
-| `event_loop(platform)` | a `Loop` over a platform, with nothing registered |
+| `signalled()` | whether a source is raised and not yet drained — for a `Driver` to check before it sleeps |
+| `event_loop(driver)` | a `&Loop[D]` over a driver, with nothing registered |
 | `ev.on(n, cb)` / `ev.off(n)` | the handler for source `n`; `on` answers `Err(OutOfRange(n))` or `Err(Taken(n))` |
 | `ev.after(d, cb)` / `ev.every(d, cb)` | a one-shot or repeating timer, answering a `Timer` |
 | `ev.cancel(t)` | cancel a timer; answers whether it was still pending |
 | `ev.idle(cb)` / `ev.check(cb)` / `ev.remove(h)` | handles that run on every pass |
 | `ev.run()` / `ev.stop()` / `ev.now()` | run until stopped or until nothing is left; the pass's time |
 
-Every callback is a `&Fn(*Loop) -> unit`: it is handed the loop, so it can set a timer or stop the
-loop without capturing it. (A sysl closure captures **by value**, so a closure that captured a `Loop`
-would be holding a copy.)
+Every callback is a `&Fn(*Loop[D]) -> unit`: it is handed the loop, so it can set a timer or stop the
+loop without capturing it.
 
 **What one pass does, in order:** read the clock once; fire the timers due at that reading, earliest
 first, equal deadlines in the order they were set; run the idle handles; drain the pending sources and
-run each raised one's handler, lowest number first; run the check handles. Then it returns if `stop`
-was called or nothing is left, and otherwise waits — not at all if an idle handle exists, a timer is
-already due or a source is raised, and otherwise `idle_until` the nearest live timer, or
-`idle_until(None)` if there is none.
+run each raised one's handler, lowest number first; step each task woken so far, once, in the order
+it was woken; run the check handles. Then it returns if `stop` was called or nothing is left, and
+otherwise waits — not at all if an idle handle exists, a task is woken, a timer is already due or a
+source is raised, and otherwise `idle_until` the nearest live timer, or `idle_until(None)` if there is
+none.
 
 - **A source is a bit, not a queue.** Two signals before a pass run the handler once; the handler
   drains whatever its hardware buffered.
@@ -81,6 +82,58 @@ already due or a source is raised, and otherwise `idle_until` the nearest live t
 - **An out-of-range source number** is refused at run time by `on` with `OutOfRange`, and ignored by
   `signal`, which has nobody to refuse it to. A source is a bit of a 32-bit word and sysl has no
   type to make the bound a compile-time one without costing every call site a constructor.
+
+## Tasks
+
+The loop is also an executor for sysl's `async` functions, written against the language's own
+contract (`step`, `park`, `yield_now`): a task runs until it parks, and the waker its park hands out
+is kept where the event will find it — a timer's callback, a source's handler.
+
+```sysl
+import sh.sysl.kairos.{Loop, event_loop}
+import sh.sysl.kairos.host.{Host, host}
+import sysl.time.millis
+
+async blink(lp: &Loop[Host], n: int)
+    for i in 0..<n
+        print("on")
+        await lp.sleep(millis(100))
+
+async sample(lp: &Loop[Host]) -> int
+    val r = await lp.wait_for(0)                  // the next DMA interrupt
+    if r.is_ok() then 1 else 0
+
+val lp = event_loop(host())
+
+lp.spawn(blink(lp, 3))
+print(lp.block_on(lp.timeout(millis(250), sample(lp))))   // no DMA on a host, so it times out
+```
+
+```output
+on
+on
+on
+Ok(None)
+```
+
+| | |
+|---|---|
+| `lp.spawn(t)` / `lp.abort(j)` | hand a `Task[unit]` to the loop, answering a `Job`; drop it, which cancels it |
+| `lp.block_on(t)` | run passes until `t` ends; `Ok(v)`, `Err(Stalled(n))` or `Err(Stopped)` |
+| `await lp.sleep(d)` | end `d` after the pass that first steps it |
+| `await lp.wait_for(n)` | end the next time source `n` is raised; `Err(Taken(n))` if something else handles it |
+| `await lp.timeout(d, t)` | `Some` of `t`'s result, or `None` once `d` has passed, dropping `t` |
+| `lp.running()` | how many spawned tasks have not finished |
+
+- **Cancelling is dropping.** A task that is aborted, or dropped by a `timeout`, runs its `defer`s,
+  and `sleep` and `wait_for` give back their timer and their source there — so a cancelled task
+  leaves nothing in the loop to keep it alive.
+- **A task woken during a pass's stepping is stepped on the next pass**, so a task that only yields
+  takes one step a pass and cannot keep a pass from ending.
+- **A parked task does not keep the loop alive by itself.** Once nothing is left that could wake it —
+  no timer, source or handle — `run` cancels it, and `block_on` answers `Stalled`.
+- **A task that finishes in the pass its timeout falls due wins.**
+- The loop is a `&Loop[D]` because a task reaches it through the box for as long as it runs.
 
 ## The interrupt contract
 
@@ -100,15 +153,18 @@ Cortex-M7 `pending.or` compiles to an `ldrex`/`orr`/`strex` loop. **Nothing on t
 allocates, touches a closure, or can block.** Everything else — the handler table, the timer queue,
 the handles — lives on the `Loop`, and runs on the loop's side.
 
-## The platform
+## The driver
 
 ```sysl
-trait Platform
+trait Driver
     now(*self) -> Duration
     idle_until(*self, deadline: Option[Duration])
 ```
 
-Time is a `sysl.time.Duration` from an origin the platform chooses, and never goes backwards.
+The machine is a value chosen in code — `event_loop(host())`, `event_loop(sim())`, a board's — and the
+loop is generic over it, so the choice costs nothing at run time and needs no package feature.
+
+Time is a `sysl.time.Duration` from an origin the driver chooses, and never goes backwards.
 `idle_until` waits until the deadline or until a source is signalled, whichever is first, and may
 return early for any reason; `None` means no timer is pending, so only an interrupt can give the loop
 work. **It must return at once if `signalled()` is already true** — the loop checks before calling,
@@ -127,7 +183,7 @@ Two ship:
   slices of a millisecond, checking `signalled()` between them, so a second thread standing in for a
   peripheral is noticed within a millisecond.
 
-**The board platform comes with the board.** It is the trait above and nothing more: `now` reads a
+**The board driver comes with the board.** It is the trait above and nothing more: `now` reads a
 SysTick-driven tick count (or a free-running timer), and `idle_until` masks interrupts, returns if
 `signalled()`, programs the SysTick or a timer compare for the deadline when there is one, executes
 `wfi`, and unmasks. WFI wakes on a pending interrupt even while interrupts are masked, which is what
@@ -135,14 +191,12 @@ closes the window between the loop's last look and the sleep.
 
 ## What v0.1 is not
 
-- **No async face.** sysl does not ship `async`/`await` yet; callbacks are the API, and an async face
-  can be added over them later without changing these signatures.
 - **No priorities.** One loop, one level. Two-priority executors (an urgent loop run from a low
   priority interrupt beside the background one) are a later version, as further `Loop`s over the
   same trait.
-- **No board platform.** It comes with the hardware (an STM32H747) and is described above.
-- **No libuv backend.** A `Platform` over `sh.sysl.libuv` would give the same API on a desktop with
-  real I/O; it is a later package, so this one never puts `-luv` on a board's link line.
+- **No board driver.** It comes with the hardware (an STM32H747) and is described above.
+- **No libuv driver yet.** A `Driver` over `sh.sysl.libuv` gives the same API on a desktop with real
+  I/O; it is to come behind one opt-in `uv` feature, so a board's link line never carries `-luv`.
 
 ## What it needs
 
@@ -153,8 +207,8 @@ operating system.
 ## Proving it builds for the board
 
 A program that reaches every part of the loop a firmware would -- an interrupt handler calling
-`signal`, a source handler, a repeating and a one-shot timer, a check handle, `run` -- compiled for the
-Cortex-M7 target:
+`signal`, a source handler, a repeating and a one-shot timer, a check handle, a task that sleeps,
+waits on a source and times out, `run` -- compiled for the Cortex-M7 target:
 
 ```
 sysl build-c <probe dir> --target thumbv7em-freestanding --lib <this checkout>
@@ -172,16 +226,16 @@ twice). So it is here in full -- a `package.hocon` with `requires { heap = true 
 `main.sysl`:
 
 ```sysl
-import sh.sysl.kairos.{Platform, event_loop, signal, signalled}
+import sh.sysl.kairos.{Driver, Loop, event_loop, signal, signalled}
 import sysl.time.{Duration, micros, millis}
 
-// A stand-in for the board's platform: a tick count the loop's own waits move on. The real one
-// reads SysTick and executes WFI; what this proves is that the loop, its timers and its handles
-// compile for the target and reach no module storage an initializer would have to fill.
+// A stand-in for the board's driver: a tick count the loop's own waits move on. The real one
+// reads SysTick and executes WFI; what this proves is that the loop, its timers, its handles and its
+// tasks compile for the target and reach no module storage an initializer would have to fill.
 struct Ticks
     at: Duration
 
-impl Platform for Ticks
+impl Driver for Ticks
     now(*self) -> Duration = self.at
 
     idle_until(*self, deadline: Option[Duration])
@@ -195,18 +249,28 @@ impl Platform for Ticks
 dma_done()
     signal(0)
 
+async worker(lp: &Loop[Ticks])
+    await lp.sleep(millis(5))
+    val r = await lp.wait_for(1)
+    val v = await lp.timeout(millis(3), lp.sleep(millis(1)))
+
 @export("main")
 boot() -> int
     val board: &Ticks = Ticks(micros(0))
-    var ev = event_loop(board)
+    val ev = event_loop(board)
 
     ev.on(0, (lp) -> lp.off(0))
     ev.every(millis(10), (lp) -> ())
     ev.after(millis(100), (lp) -> lp.stop())
     ev.check((lp) -> ())
+    ev.spawn(worker(ev))
     ev.run()
     0
 ```
+
+The archive's symbols show every `Loop` member and every task instantiated at `Ticks` —
+`sh.sysl.kairos$Loop.run.Ticks`, `sh.sysl.kairos$sleep_on.Ticks` — so the driver is chosen at
+compile time and costs nothing at run time.
 
 ## Testing
 
@@ -215,8 +279,9 @@ sysl test .
 SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
 ```
 
-Every test runs on the simulated platform: deterministic, no real sleeping, each asserting a whole
-timeline of what ran and when, and the deadlines `idle_until` was handed.
+Every test but one runs on the simulated driver: deterministic, no real sleeping, each asserting a
+whole timeline of what ran and when, and the deadlines `idle_until` was handed. The one on the host
+driver checks that two sleeps take at least their sum of real time.
 
 ## License
 

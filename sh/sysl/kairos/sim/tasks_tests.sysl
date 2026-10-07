@@ -1,0 +1,348 @@
+module sh.sysl.kairos.sim
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{millis, whole_micros}
+import sh.sysl.kairos.{Loop, Job, event_loop, signalled, Stalled, Stopped, Taken}
+
+/** Tasks on the loop, on the simulated driver.
+ *
+ * Every test records what each task did and at what simulated millisecond into one log, and asserts
+ * the log whole, together with the deadlines the loop waited for -- so a task that ran early, late
+ * or twice is a disagreement rather than a count that happens to match.
+ */
+
+private clock(lp: &Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private deadlines(s: &Sim) -> Buf[long]
+    var out: Buf[long] = buf()
+
+    for w in s.waits()
+        out.push(w match
+            Some(d) -> whole_micros(d) / 1000
+            None -> -1)
+
+    out
+end deadlines
+
+private async nap(lp: &Loop[Sim], log: &Buf[string], name: string, ms: long)
+    await lp.sleep(millis(ms))
+    log.push(s"$name@${clock(lp)}")
+
+// Sleeps, and says so if it is dropped before it wakes.
+private async guarded(lp: &Loop[Sim], log: &Buf[string], name: string, ms: long) -> long
+    defer log.push(s"$name closed@${clock(lp)}")
+    await lp.sleep(millis(ms))
+    log.push(s"$name woke@${clock(lp)}")
+    ms
+
+private async victim(lp: &Loop[Sim], log: &Buf[string])
+    defer log.push(s"victim closed@${clock(lp)}")
+    await lp.sleep(millis(100))
+    log.push("victim woke")
+
+private async parked_for_ever(log: &Buf[string])
+    defer log.push("parked closed")
+    await park((w) -> ())
+
+// ---- sleeping -----------------------------------------------------------------------------------
+
+@test("spawned tasks sleep on the loop's timers and wake in deadline order, each at its deadline")
+sleeps_wake_in_deadline_order()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 10))
+    lp.spawn(nap(lp, log, "b", 5))
+    lp.spawn(nap(lp, log, "c", 7))
+    lp.run()
+
+    assert_eq(log.view(), ["b@5", "c@7", "a@10"])
+    assert_eq(deadlines(s).view(), [5, 7, 10])
+    assert_eq(lp.running(), 0)
+end sleeps_wake_in_deadline_order
+
+@test("sleeps due at the same moment wake in the order the tasks were spawned")
+equal_sleeps_are_fifo()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "x", 4))
+    lp.spawn(nap(lp, log, "y", 4))
+    lp.spawn(nap(lp, log, "z", 4))
+    lp.run()
+
+    assert_eq(log.view(), ["x@4", "y@4", "z@4"])
+    assert_eq(deadlines(s).view(), [4])
+end equal_sleeps_are_fifo
+
+private async yielder(log: &Buf[string], name: string, n: int)
+    for i in 0..<n
+        log.push(s"$name$i")
+        await yield_now()
+
+@test("tasks that only yield take turns, one step each a pass, and the loop never waits")
+yielding_tasks_interleave()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(yielder(log, "a", 3))
+    lp.spawn(yielder(log, "b", 2))
+    lp.run()
+
+    assert_eq(log.view(), ["a0", "b0", "a1", "b1", "a2"])
+    assert_eq(s.waits().len, 0)
+end yielding_tasks_interleave
+
+private async parent(lp: &Loop[Sim], log: &Buf[string])
+    log.push(s"parent@${clock(lp)}")
+    await lp.sleep(millis(3))
+    lp.spawn(nap(lp, log, "child", 2))
+    log.push(s"spawned@${clock(lp)}")
+    await lp.sleep(millis(10))
+    log.push(s"parent done@${clock(lp)}")
+end parent
+
+@test("a task may spawn another, which first runs on the next pass and then keeps its own time")
+spawn_from_inside_a_task()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(parent(lp, log))
+    lp.run()
+
+    assert_eq(log.view(), ["parent@0", "spawned@3", "child@5", "parent done@13"])
+    assert_eq(deadlines(s).view(), [3, 5, 13])
+end spawn_from_inside_a_task
+
+// ---- sources ------------------------------------------------------------------------------------
+
+private async on_source(lp: &Loop[Sim], log: &Buf[string], n: u32)
+    val r = await lp.wait_for(n)
+
+    r match
+        Ok(_) -> log.push(s"raised $n@${clock(lp)}")
+        Err(Taken(m)) -> log.push(s"taken $m")
+        Err(_) -> log.push("refused")
+end on_source
+
+@test("a task awaiting a source wakes when an interrupt raises it, and frees the source afterwards")
+await_a_signalled_source()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    s.irq_at(millis(6), 3)
+    lp.spawn(on_source(lp, log, 3))
+    lp.run()
+
+    assert_eq(log.view(), ["raised 3@6"])
+    assert_eq(deadlines(s).view(), [-1])
+    assert(lp.on(3, (l) -> ()).is_ok())
+    assert(!signalled())
+end await_a_signalled_source
+
+@test("awaiting a source something else already handles is refused with Taken, and waits for nothing")
+await_a_taken_source()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.on(4, (l) -> ())
+    lp.spawn(on_source(lp, log, 4))
+    lp.after(millis(1), (l) -> l.off(4))
+    lp.run()
+
+    assert_eq(log.view(), ["taken 4"])
+    assert_eq(deadlines(s).view(), [1])
+end await_a_taken_source
+
+// ---- timeouts -----------------------------------------------------------------------------------
+
+private async timed(lp: &Loop[Sim], log: &Buf[string], limit: long, work: long)
+    val r = await lp.timeout(millis(limit), guarded(lp, log, "work", work))
+
+    r match
+        Some(v) -> log.push(s"finished $v@${clock(lp)}")
+        None -> log.push(s"timed out@${clock(lp)}")
+end timed
+
+@test("a timeout that passes first drops the task it ran, which closes and lets go of its timer")
+timeout_fires_first()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(timed(lp, log, 5, 20))
+    lp.run()
+
+    assert_eq(log.view(), ["work closed@5", "timed out@5"])
+    assert_eq(deadlines(s).view(), [5])
+end timeout_fires_first
+
+@test("a task that finishes before its timeout answers its result, and the timeout's timer is cancelled")
+task_beats_timeout()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(timed(lp, log, 20, 5))
+    lp.run()
+
+    assert_eq(log.view(), ["work woke@5", "work closed@5", "finished 5@5"])
+    assert_eq(deadlines(s).view(), [5])
+end task_beats_timeout
+
+@test("a task that finishes in the pass its timeout falls due wins")
+tie_goes_to_the_task()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(timed(lp, log, 8, 8))
+    lp.run()
+
+    assert_eq(log.view(), ["work woke@8", "work closed@8", "finished 8@8"])
+end tie_goes_to_the_task
+
+private async timed_yields(lp: &Loop[Sim], log: &Buf[string])
+    val r = await lp.timeout(millis(50), yielder(log, "y", 3))
+    log.push(if r.is_some() then s"done@${clock(lp)}" else "timed out")
+
+@test("a task that yields under a timeout is stepped once per pass, as it would be on its own")
+timeout_over_a_yielding_task()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(timed_yields(lp, log))
+    lp.spawn(yielder(log, "o", 3))
+    lp.run()
+
+    assert_eq(log.view(), ["y0", "o0", "y1", "o1", "y2", "o2", "done@0"])
+    assert_eq(s.waits().len, 0)
+end timeout_over_a_yielding_task
+
+// ---- cancellation -------------------------------------------------------------------------------
+
+@test("aborting a spawned task drops it: its defer runs, its timer goes, and the loop ends at once")
+abort_cancels_by_drop()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+    val j: &Buf[Job] = buf()
+
+    j.push(lp.spawn(victim(lp, log)))
+    lp.after(millis(3), (l) -> log.push(if l.abort(j[0]) then "aborted" else "gone"))
+    lp.after(millis(4), (l) -> log.push(if l.abort(j[0]) then "aborted" else "gone"))
+    lp.run()
+
+    assert_eq(log.view(), ["victim closed@3", "aborted", "gone"])
+    assert_eq(deadlines(s).view(), [3, 4])
+    assert_eq(lp.running(), 0)
+end abort_cancels_by_drop
+
+@test("a task parked on nothing the loop could ever wake is cancelled when run ends")
+run_cancels_a_stalled_task()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(parked_for_ever(log))
+    lp.spawn(nap(lp, log, "n", 2))
+    lp.run()
+
+    assert_eq(log.view(), ["n@2", "parked closed"])
+    assert_eq(lp.running(), 0)
+end run_cancels_a_stalled_task
+
+// ---- block_on -----------------------------------------------------------------------------------
+
+private async answer_after(lp: &Loop[Sim], ms: long, v: int) -> int
+    await lp.sleep(millis(ms))
+    v
+
+@test("block_on answers the task's result, with spawned tasks taking their turns beside it")
+block_on_answers()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "early", 2))
+    lp.spawn(nap(lp, log, "late", 30))
+
+    assert_eq(lp.block_on(answer_after(lp, 10, 42)), Ok(42))
+    assert_eq(log.view(), ["early@2"])
+    assert_eq(lp.running(), 1)
+
+    lp.run()
+    assert_eq(log.view(), ["early@2", "late@30"])
+end block_on_answers
+
+private async seven() -> int
+    await yield_now()
+    7
+
+@test("block_on of a task that has already finished answers its result without the loop waiting")
+block_on_a_finished_task()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val t = seven()
+
+    assert(!step(t, () -> ()))
+    assert(step(t, () -> ()))
+    assert_eq(lp.block_on(t), Ok(7))
+    assert_eq(s.waits().len, 0)
+    assert_eq(clock(lp), 0)
+end block_on_a_finished_task
+
+private async never_answers(log: &Buf[string]) -> int
+    defer log.push("never closed")
+    await park((w) -> ())
+    0
+
+@test("block_on of a task nothing could wake answers Stalled, counting every task it cancelled")
+block_on_stalls()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(parked_for_ever(log))
+
+    assert_eq(lp.block_on(never_answers(log)), Err(Stalled(2)))
+    assert_eq(log.view(), ["parked closed", "never closed"])
+    assert_eq(lp.running(), 0)
+end block_on_stalls
+
+@test("block_on answers Stopped when stop is called first, and cancels the task it was running")
+block_on_stopped()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.after(millis(5), (l) -> l.stop())
+
+    assert_eq(lp.block_on(guarded(lp, log, "slow", 10)), Err(Stopped))
+    assert_eq(log.view(), ["slow closed@5"])
+    assert_eq(lp.running(), 0)
+end block_on_stopped

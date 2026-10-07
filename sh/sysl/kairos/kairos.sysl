@@ -36,16 +36,18 @@ signal(n: u32)
 
 /** Whether any source is raised and not yet drained.
  *
- * **This is what a `Platform.idle_until` checks before it sleeps**, with interrupts masked, so that a
+ * **This is what a `Driver.idle_until` checks before it sleeps**, with interrupts masked, so that a
  * signal landing between the loop's last look and the sleep instruction wakes it rather than waiting
  * for the next one. On a Cortex-M that is `cpsid i`, this, `wfi`, `cpsie i`: WFI wakes on a pending
  * interrupt even while interrupts are masked.
  */
 signalled() -> bool = pending.load() != 0
 
-/** Where the loop's time comes from and how it waits. One implementation per machine.
+/** The machine the loop runs on: where its time comes from and how it waits. A driver is a value the
+ * program chooses in code -- `host()` for a laptop, `sim()` for a test, one for a board -- and the
+ * loop is generic over it, so the choice costs nothing at run time.
  *
- * Time is a `Duration` from an origin the platform chooses -- boot, on a board -- and never goes
+ * Time is a `Duration` from an origin the driver chooses -- boot, on a board -- and never goes
  * backwards.
  *
  * `idle_until` waits until the deadline or until something is signalled, whichever is first, and it
@@ -54,14 +56,9 @@ signalled() -> bool = pending.load() != 0
  * as WFI with SysTick, or a one-shot timer compare, set for the deadline; it must return at once if
  * `signalled()` is already true.
  */
-trait Platform
+trait Driver
     now(*self) -> Duration
     idle_until(*self, deadline: Option[Duration])
-
-/** Everything the loop calls back is handed the loop, so a callback can add a timer or stop the loop
- * without capturing the loop it is registered on.
- */
-type Callback = &Fn(*Loop) -> unit
 
 /** Why `Loop.on` refused a source. */
 enum SourceError
@@ -122,10 +119,43 @@ end Slots
 
 private slots[T]() -> Slots[T] = Slots(buf(), buf(), 0)
 
+/** A task handed to `spawn`, as `spawn` answers it: the thing `abort` takes. */
+struct Job
+    private slot: u32
+    private gen: u32
+
+/** Why `block_on` came back without its task's result. */
+enum RunError
+    /** Nothing left in the loop could ever wake the task -- no timer, source or handle -- so it was
+     * cancelled, with every other task in the same state; `parked` counts them all.
+     */
+    Stalled(parked: usize)
+
+    /** `stop` was called before the task finished. The task was cancelled. */
+    Stopped
+
+impl Eq for RunError
+    eq(self, rhs: RunError) -> bool = (self, rhs) match
+        (Stalled(a), Stalled(b)) -> a == b
+        (Stopped, Stopped) -> true
+        _ -> false
+
+impl Display for RunError
+    display(self, out: *Writer, fmt: FormatSpec) = self match
+        Stalled(n) -> display_str(s"$n task(s) parked with nothing left to wake them", out, fmt)
+        Stopped -> display_str("the loop was stopped first", out, fmt)
+
 /** A timer's state; its place in the deadline order is a `Due` in the queue. */
-private struct TimerState
-    cb: Callback
+private struct TimerState[D: Driver]
+    cb: &Fn(*Loop[D]) -> unit
     period: Option[Duration]
+
+/** The run queue: the tasks woken since they were last stepped, by slot and generation. It is a box
+ * of its own because every waker holds it, and a waker holding the loop would close a cycle through
+ * the task that holds the waker.
+ */
+private struct Ready
+    woken: Buf[Job]
 
 /** One entry of the deadline queue. Ordered by deadline, then by the order entries were queued, so
  * two timers due at the same moment fire in the order they were set.
@@ -144,30 +174,43 @@ impl Ord for Due
 
 /** The loop. Build one in `main`, register what it should do, and `run` it.
  *
+ * Everything the loop calls back is handed the loop, so a callback can add a timer or stop the loop
+ * without capturing the loop it is registered on.
+ *
  * Each pass of `run`, in order:
  *
- * 1. reads the platform's clock once; every timer set during the pass is set from that reading;
+ * 1. reads the driver's clock once; every timer set during the pass is set from that reading;
  * 2. fires the timers that were due at that reading, earliest first;
  * 3. runs the idle handles;
  * 4. drains the pending sources, and runs the handler of each raised one;
- * 5. runs the check handles;
- * 6. returns if `stop` was called or nothing is left, and otherwise waits: not at all if an idle
- *    handle exists, a timer is already due or a source is raised; else `idle_until` the nearest
- *    timer, or `idle_until(None)` if there is none.
+ * 5. steps each task woken so far, once, in the order it was woken;
+ * 6. runs the check handles;
+ * 7. returns if `stop` was called or nothing is left, and otherwise waits: not at all if an idle
+ *    handle exists, a task is woken, a timer is already due or a source is raised; else
+ *    `idle_until` the nearest timer, or `idle_until(None)` if there is none.
+ *
+ * **The loop is also the executor.** A task is a `Task[unit]` handed to `spawn`; it runs until it
+ * parks, and the waker its park hands out puts it back on the run queue -- from a timer, a source's
+ * handler, or another task. A task woken while the tasks are being stepped waits for the next pass,
+ * so one that only yields cannot keep a pass from ending. A parked task does not by itself keep the
+ * loop alive: once nothing is left that could wake it, it is cancelled.
  */
-struct Loop
-    private platform: &Platform
-    private handlers: [32]Option[Callback]
+struct Loop[D: Driver]
+    private driver: &D
+    private handlers: [32]Option[&Fn(*Loop[D]) -> unit]
     private registered: u32
-    private timers: Slots[TimerState]
+    private timers: Slots[TimerState[D]]
     private queue: Heap[Due]
     private seq: u64
-    private idles: Slots[Callback]
-    private checks: Slots[Callback]
+    private idles: Slots[&Fn(*Loop[D]) -> unit]
+    private checks: Slots[&Fn(*Loop[D]) -> unit]
+    private tasks: Slots[Task[unit]]
+    private ready: &Ready
+    private stepping: Buf[Job]
     private time: Duration
     private stopping: bool
 
-    /** The time this pass started, as the platform read it. */
+    /** The time this pass started, as the driver read it. */
     now(self) -> Duration = self.time
 
     /** Handle source `n` with `cb` on every pass where it was raised.
@@ -175,7 +218,7 @@ struct Loop
      * A source has one handler: a second `on` for the same number is refused with `Taken`, and the
      * first one stays. `off` frees it.
      */
-    on(*self, n: u32, cb: Callback) -> Result[unit, SourceError]
+    on(*self, n: u32, cb: &Fn(*Loop[D]) -> unit) -> Result[unit, SourceError]
         if n >= max_sources then return Err(OutOfRange(n))
         if (self.registered & (1 << n)) != 0 then return Err(Taken(n))
 
@@ -194,14 +237,14 @@ struct Loop
     end off
 
     /** Call `cb` once, `delay` from the start of this pass. */
-    after(*self, delay: Duration, cb: Callback) -> Timer = self.schedule(delay, None, cb)
+    after(*self, delay: Duration, cb: &Fn(*Loop[D]) -> unit) -> Timer = self.schedule(delay, None, cb)
 
     /** Call `cb` every `period`, the first time `period` from the start of this pass.
      *
      * The deadlines are exact multiples of `period` from the first: a pass that runs late does not
      * push the next deadline back. A period of zero fires once a pass.
      */
-    every(*self, period: Duration, cb: Callback) -> Timer = self.schedule(period, Some(period), cb)
+    every(*self, period: Duration, cb: &Fn(*Loop[D]) -> unit) -> Timer = self.schedule(period, Some(period), cb)
 
     /** Cancel a timer. Answers whether it was still pending; a one-shot that has fired, or a timer
      * already cancelled, answers false. A timer may cancel itself, or any other, from a callback.
@@ -211,14 +254,14 @@ struct Loop
     /** Run `cb` on every pass, and never sleep while it exists: for work that must be polled as fast
      * as the machine allows.
      */
-    idle(*self, cb: Callback) -> Handle
+    idle(*self, cb: &Fn(*Loop[D]) -> unit) -> Handle
         val (slot, gen) = self.idles.add(cb)
         Handle(true, slot, gen)
 
     /** Run `cb` on every pass, after the sources are drained, and sleep as usual: for a library that
      * must be polled after anything happens -- TinyUSB's `tud_task`, LVGL's timer handler.
      */
-    check(*self, cb: Callback) -> Handle
+    check(*self, cb: &Fn(*Loop[D]) -> unit) -> Handle
         val (slot, gen) = self.checks.add(cb)
         Handle(false, slot, gen)
 
@@ -230,29 +273,122 @@ struct Loop
     stop(*self)
         self.stopping = true
 
-    /** Whether anything is left that could ever run: a timer, a handle or a source. */
-    alive(self) -> bool =
-        self.registered != 0 || self.timers.live > 0 || self.idles.live > 0 || self.checks.live > 0
+    /** Whether anything is left that could ever run: a timer, a handle, a source or a woken task. */
+    alive(self) -> bool
+        if self.registered != 0 || self.timers.live > 0 then return true
 
-    /** Run passes until `stop` is called or nothing is left. */
+        self.idles.live > 0 || self.checks.live > 0 || !self.ready.woken.is_empty()
+
+    /** How many tasks are spawned and not yet finished or cancelled, parked or woken. */
+    running(self) -> usize = self.tasks.live
+
+    /** Hand `t` to the loop. It is first stepped on the next pass, in turn with the other tasks. */
+    spawn(*self, t: Task[unit]) -> Job
+        val (slot, gen) = self.tasks.add(t)
+        val j = Job(slot, gen)
+
+        self.ready.woken.push(j)
+        j
+    end spawn
+
+    /** Cancel a spawned task by dropping it: its `defer`s run, and whatever it was waiting on lets
+     * go of it. Answers whether it was still there; a task that has finished answers false. A task
+     * may abort itself.
+     */
+    abort(*self, j: Job) -> bool = self.tasks.remove(j.slot, j.gen)
+
+    /** Run passes until `stop` is called or nothing is left. A task still parked when nothing is left
+     * that could wake it is cancelled.
+     */
     run(*self)
+        self.drive(() -> false)
+
+    /** Run passes until `t` has its result, with every spawned task taking its turn beside it, and
+     * answer that result. It returns as soon as `t` has finished, leaving the rest where they are.
+     */
+    block_on[T](*self, t: Task[T]) -> Result[T, RunError]
+        val out: &Outcome[T] = outcome()
+        val j = self.spawn(fill(t, out))
+        val parked = self.drive(() -> out.value.is_some())
+
+        out.value match
+            Some(v) -> Ok(v)
+            None ->
+                if parked > 0 then return Err(Stalled(parked))
+
+                self.abort(j)
+                Err(Stopped)
+    end block_on
+
+    /** A task that ends `d` after the pass that first steps it. Dropped early, it cancels its timer. */
+    sleep(&self, d: Duration) -> Task[unit] = sleep_on(self, d)
+
+    /** A task that ends the next time source `n` is raised. It holds the source's one handler while
+     * it waits, so it is refused with `Taken` where something else already handles `n`, and frees
+     * the source when it ends or is dropped.
+     */
+    wait_for(&self, n: u32) -> Task[Result[unit, SourceError]] = wait_on(self, n)
+
+    /** A task that runs `t` and ends with `Some` of its result, or with `None` if `d` passes first, in
+     * which case `t` is dropped, which cancels it. A `t` that finishes in the pass its deadline falls
+     * due still wins.
+     */
+    timeout[T](&self, d: Duration, t: Task[T]) -> Task[Option[T]] = timeout_on(self, d, t)
+
+    // Passes until `done` says so, `stop` is called, or nothing is left; answers how many parked
+    // tasks were cancelled because nothing was left that could wake them.
+    private drive(*self, done: &Fn() -> bool) -> usize
         self.stopping = false
 
         while self.alive()
-            self.time = self.platform.now()
+            self.time = self.driver.now()
             self.fire_timers()
             self.run_handles(true)
             self.drain()
+            self.step_ready()
             self.run_handles(false)
 
-            if self.stopping || !self.alive() then break
+            if self.stopping || done() || !self.alive() then break
 
             self.wait()
 
         self.stopping = false
-    end run
 
-    private schedule(*self, delay: Duration, period: Option[Duration], cb: Callback) -> Timer
+        if self.alive() || done() then 0 else self.cancel_parked()
+    end drive
+
+    // Step each task woken before this point once. Wakers called while stepping push onto the other
+    // buffer, which the next pass steps.
+    private step_ready(*self)
+        val woken = self.ready.woken
+
+        self.ready.woken = self.stepping
+        self.stepping = woken
+
+        for k in 0..<woken.len()
+            val j = woken[k]
+
+            self.tasks.get(j.slot, j.gen) match
+                Some(t) ->
+                    val q = self.ready
+
+                    if step(t, () -> q.woken.push(j)) then self.tasks.remove(j.slot, j.gen)
+                None -> ()
+
+        self.stepping.clear()
+    end step_ready
+
+    private cancel_parked(*self) -> usize
+        val n = self.tasks.live
+
+        for i in 0..<self.tasks.entries.len()
+            val e = self.tasks.entries[i]
+            if e.item.is_some() then self.tasks.remove(u32(i), e.gen)
+
+        n
+    end cancel_parked
+
+    private schedule(*self, delay: Duration, period: Option[Duration], cb: &Fn(*Loop[D]) -> unit) -> Timer
         val (slot, gen) = self.timers.add(TimerState(cb, period))
         self.enqueue(self.time + delay, slot, gen)
         Timer(slot, gen)
@@ -320,16 +456,19 @@ struct Loop
     end drain
 
     private wait(*self)
-        if self.idles.live > 0 || signalled() then return
+        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled() then return
 
         val deadline = self.next_deadline()
 
         deadline match
-            Some(d) -> if d > self.platform.now() then self.platform.idle_until(deadline)
-            None -> self.platform.idle_until(None)
+            Some(d) -> if d > self.driver.now() then self.driver.idle_until(deadline)
+            None -> self.driver.idle_until(None)
     end wait
 end Loop
 
-/** A loop over `platform`, with nothing registered. */
-event_loop(platform: &Platform) -> Loop =
-    Loop(platform, [None; 32], 0, slots(), heap(), 0, slots(), slots(), platform.now(), false)
+/** A loop over `driver`, with nothing registered. It is a `&Loop` because a task reaches the loop it
+ * runs on through the box -- `await lp.sleep(…)` -- for as long as it runs.
+ */
+event_loop[D: Driver](driver: &D) -> &Loop[D] =
+    Loop(driver, [None; 32], 0, slots(), heap(), 0, slots(), slots(), slots(), Ready(buf()), buf(),
+        driver.now(), false)

@@ -5,7 +5,7 @@ import sysl.buf.{Buf, buf}
 import sysl.time.{Duration, millis, whole_micros}
 import sh.sysl.kairos.{Loop, Timer, Handle, SourceError, event_loop, signal, signalled, OutOfRange, Taken}
 
-/** The loop on the simulated platform.
+/** The loop on the simulated driver.
  *
  * **Every timeline here is asserted whole**, as the list of what ran and when, so a defect that moves
  * one event shows up as a disagreement rather than as a count that still happens to match. Time is
@@ -14,7 +14,7 @@ import sh.sysl.kairos.{Loop, Timer, Handle, SourceError, event_loop, signal, sig
  * defect it would otherwise hide.
  */
 
-private ms(lp: *Loop) -> long = whole_micros(lp.now()) / 1000
+private ms(lp: *Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
 
 // Every deadline `idle_until` was called with, in milliseconds; a wait with no deadline is `forever`.
 private const forever: long = -1

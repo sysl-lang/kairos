@@ -2,9 +2,9 @@ module sh.sysl.kairos.sim
 
 import sysl.buf.{Buf, buf}
 import sysl.time.{Duration, micros}
-import sh.sysl.kairos.{Platform, signal, signalled}
+import sh.sysl.kairos.{Driver, signal, signalled}
 
-/** A platform with a clock that moves only when it is told to, for tests.
+/** A driver with a clock that moves only when it is told to, for tests.
  *
  * `idle_until` is where time passes: it jumps the clock to the deadline, or to the first interrupt
  * scheduled before it, raises that interrupt's source with `signal` exactly as an interrupt handler
@@ -63,7 +63,7 @@ private struct Irq
     at: Duration
     n: u32
 
-/** A simulated platform at time zero, with nothing scheduled. */
+/** A simulated driver at time zero, with nothing scheduled. */
 sim() -> &Sim = Sim(micros(0), 0, buf(), buf())
 
 /** How many times the clock may be read before the simulation calls it a hang. The loop reads it at
@@ -72,7 +72,7 @@ sim() -> &Sim = Sim(micros(0), 0, buf(), buf())
  */
 private const max_reads: usize = 100000
 
-impl Platform for Sim
+impl Driver for Sim
     now(*self) -> Duration
         self.reads += 1
         if self.reads > max_reads then panic(s"the loop has read the clock $max_reads times: it is spinning")

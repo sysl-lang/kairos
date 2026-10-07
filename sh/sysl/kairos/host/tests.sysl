@@ -1,0 +1,24 @@
+module sh.sysl.kairos.host
+@tests
+
+import sysl.time.{millis, whole_micros}
+import sysl.posix.time.monotonic
+import sh.sysl.kairos.{Loop, event_loop}
+
+private async two_naps(lp: &Loop[Host]) -> long
+    await lp.sleep(millis(10))
+    await lp.sleep(millis(15))
+    whole_micros(lp.now()) / 1000
+
+@test("on the host driver a task's sleeps take real time: two naps end no sooner than their sum")
+host_sleeps_take_real_time()
+    val lp = event_loop(host())
+    val started = monotonic()
+
+    val at = lp.block_on(two_naps(lp)).expect("nothing stops this loop")
+    val took = whole_micros(monotonic() - started) / 1000
+
+    assert(at >= 25)
+    assert(took >= 25)
+    assert(took < 1000)
+end host_sleeps_take_real_time
