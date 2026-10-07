@@ -155,9 +155,14 @@ impl Display for RunError
         Stalled(n) -> display_str(s"$n task(s) parked with nothing left to wake them", out, fmt)
         Stopped -> display_str("the loop was stopped first", out, fmt)
 
+/** What the loop calls back: a timer, an idle or check handle, a source's handler. It is handed the
+ * loop it runs on, so it can set a timer or stop the loop without capturing it.
+ */
+type Callback[D: Driver] = &Fn(*Loop[D]) -> unit
+
 /** A timer's state; its place in the deadline order is a `Due` in the queue. */
 private struct TimerState[D: Driver]
-    cb: &Fn(*Loop[D]) -> unit
+    cb: Callback[D]
     period: Option[Duration]
 
 /** The run queue: the tasks woken since they were last stepped, by slot and generation. It is a box
@@ -207,13 +212,13 @@ impl Ord for Due
  */
 struct Loop[D: Driver]
     private driver: &D
-    private handlers: [32]Option[&Fn(*Loop[D]) -> unit]
+    private handlers: [32]Option[Callback[D]]
     private registered: u32
     private timers: Slots[TimerState[D]]
     private queue: Heap[Due]
     private seq: u64
-    private idles: Slots[&Fn(*Loop[D]) -> unit]
-    private checks: Slots[&Fn(*Loop[D]) -> unit]
+    private idles: Slots[Callback[D]]
+    private checks: Slots[Callback[D]]
     private tasks: Slots[Task[unit]]
     private ready: &Ready
     private stepping: Buf[Job]
@@ -228,7 +233,7 @@ struct Loop[D: Driver]
      * A source has one handler: a second `on` for the same number is refused with `Taken`, and the
      * first one stays. `off` frees it.
      */
-    on(*self, n: u32, cb: &Fn(*Loop[D]) -> unit) -> Result[unit, SourceError]
+    on(*self, n: u32, cb: Callback[D]) -> Result[unit, SourceError]
         if n >= max_sources then return Err(OutOfRange(n))
         if (self.registered & (1 << n)) != 0 then return Err(Taken(n))
 
@@ -247,14 +252,14 @@ struct Loop[D: Driver]
     end off
 
     /** Call `cb` once, `delay` from the start of this pass. */
-    after(*self, delay: Duration, cb: &Fn(*Loop[D]) -> unit) -> Timer = self.schedule(delay, None, cb)
+    after(*self, delay: Duration, cb: Callback[D]) -> Timer = self.schedule(delay, None, cb)
 
     /** Call `cb` every `period`, the first time `period` from the start of this pass.
      *
      * The deadlines are exact multiples of `period` from the first: a pass that runs late does not
      * push the next deadline back. A period of zero fires once a pass.
      */
-    every(*self, period: Duration, cb: &Fn(*Loop[D]) -> unit) -> Timer = self.schedule(period, Some(period), cb)
+    every(*self, period: Duration, cb: Callback[D]) -> Timer = self.schedule(period, Some(period), cb)
 
     /** Cancel a timer. Answers whether it was still pending; a one-shot that has fired, or a timer
      * already cancelled, answers false. A timer may cancel itself, or any other, from a callback.
@@ -264,14 +269,14 @@ struct Loop[D: Driver]
     /** Run `cb` on every pass, and never sleep while it exists: for work that must be polled as fast
      * as the machine allows.
      */
-    idle(*self, cb: &Fn(*Loop[D]) -> unit) -> Handle
+    idle(*self, cb: Callback[D]) -> Handle
         val (slot, gen) = self.idles.add(cb)
         Handle(true, slot, gen)
 
     /** Run `cb` on every pass, after the sources are drained, and sleep as usual: for a library that
      * must be polled after anything happens -- TinyUSB's `tud_task`, LVGL's timer handler.
      */
-    check(*self, cb: &Fn(*Loop[D]) -> unit) -> Handle
+    check(*self, cb: Callback[D]) -> Handle
         val (slot, gen) = self.checks.add(cb)
         Handle(false, slot, gen)
 
@@ -401,7 +406,7 @@ struct Loop[D: Driver]
         n
     end cancel_parked
 
-    private schedule(*self, delay: Duration, period: Option[Duration], cb: &Fn(*Loop[D]) -> unit) -> Timer
+    private schedule(*self, delay: Duration, period: Option[Duration], cb: Callback[D]) -> Timer
         val (slot, gen) = self.timers.add(TimerState(cb, period))
         self.enqueue(self.time + delay, slot, gen)
         Timer(slot, gen)

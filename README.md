@@ -9,11 +9,11 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.0" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1" }
 }
 ```
 
-kairos needs sysl 0.1.0-alpha.1 or later: `brew install sysl-lang/tap/sysl`.
+kairos needs sysl 0.1.0-alpha.2 or later: `brew install sysl-lang/tap/sysl`.
 
 ```sysl
 import sh.sysl.kairos.{event_loop, signal}
@@ -214,7 +214,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.0", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", features = [uv] }
 }
 ```
 
