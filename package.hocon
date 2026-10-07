@@ -16,7 +16,7 @@
 package {
   name    = "kairos"
   version = "0.1.0"
-  sysl    = "0.0.162"
+  sysl    = "0.1.0-alpha.1"
 }
 
 // **`heap`, because handlers and timers are closures, a task's frame is on the heap, and the tables

@@ -13,6 +13,8 @@ dependencies {
 }
 ```
 
+kairos needs sysl 0.1.0-alpha.1 or later: `brew install sysl-lang/tap/sysl-alpha`.
+
 ```sysl
 import sh.sysl.kairos.{event_loop, signal}
 import sh.sysl.kairos.host.host
