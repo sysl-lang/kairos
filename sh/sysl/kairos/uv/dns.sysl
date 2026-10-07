@@ -1,0 +1,18 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Name lookups, on libuv's thread pool, since `getaddrinfo` blocks on every platform.
+//
+// **A lookup already on the thread pool runs to its end**: a task dropped while it waits leaves the
+// answer to land in a cell nothing reads any more.
+
+import sh.sysl.libuv
+
+private[uv] async resolve_on(lp: &libuv.Loop, host: string, service: string, flags: i32) -> Result[[]libuv.AddrInfo, Error]
+    val p: &Pending[Result[[]libuv.AddrInfo, Error]] = pending()
+
+    libuv.resolve(host, service, (r) -> p.finish(r), libuv.AF_UNSPEC, libuv.SOCK_STREAM, flags, lp)?
+
+    await settled(p)
+#endif

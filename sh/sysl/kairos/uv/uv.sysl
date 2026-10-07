@@ -1,0 +1,150 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// The libuv driver: a loop whose waits are libuv's, so sockets, files and name lookups wake tasks
+// the way a timer or a source does.
+//
+//     val io = uv()
+//     val lp = event_loop(io)
+//
+//     lp.spawn(serve(io, io.listen(addr)?))
+//     lp.run()
+//
+// **Every operation here is a task** -- `io.connect(addr)`, `conn.read()`, `io.read_file(path)` --
+// awaited in a task of the loop beside `lp.sleep` and `lp.timeout`. Its libuv callback answers into a
+// `Pending` and calls the waker the task parked with, so the task is stepped on the next pass.
+//
+// This module exists only when the package's `uv` feature is on, which is what brings the `libuv`
+// dependency; with it off, nothing here is compiled and nothing of libuv is linked.
+
+import sh.sysl.libuv
+import sysl.time.{Duration, millis}
+import sysl.posix.time.{monotonic, sleep}
+import sh.sysl.kairos.{Driver, signalled}
+
+/** libuv's answer to an operation that failed; `e.name()` is its short name (`ECONNREFUSED`). */
+type Error = libuv.Error
+
+/** A driver over a libuv loop: the host's monotonic clock, and `idle_until` running libuv until the
+ * deadline or the next event, whichever is first.
+ *
+ * `busy` is libuv's own answer to whether the loop is alive -- an open listener, a read or a request
+ * in flight, a handle still closing -- so a task waiting on any of them keeps the kairos loop running,
+ * and a task waiting on nothing libuv watches is cancelled when nothing else is left, as on any driver.
+ *
+ * A source raised by `signal` from another thread is noticed when libuv next returns: at the next
+ * event or deadline, or within a millisecond when libuv has nothing to wait for.
+ */
+struct Uv
+    private lp: &libuv.Loop
+    private timer: &libuv.Timer
+    private origin: Duration
+
+    /** The libuv loop every handle and request this driver's operations make is on. */
+    on_loop(self) -> &libuv.Loop = self.lp
+
+    /** A task that connects to `addr` and ends with the connection, or with why there is none --
+     * `ECONNREFUSED` when nothing is listening.
+     */
+    connect(self, addr: libuv.Address) -> Task[Result[&Connection, Error]] = connect_on(self.lp, addr)
+
+    /** Bind `addr` and start listening. A port of `0` lets the kernel choose; `port()` says which. */
+    listen(self, addr: libuv.Address, backlog: int = 128) -> Result[&Listener, Error] =
+        listen_on(self.lp, addr, backlog)
+
+    /** A task that reads the whole of the file at `path`. */
+    read_file(self, path: string) -> Task[Result[[]u8, Error]] = read_file_on(self.lp, path)
+
+    /** A task that writes `bytes` as the whole of the file at `path`, creating or truncating it. */
+    write_file(self, path: string, bytes: []const u8) -> Task[Result[unit, Error]] =
+        write_file_on(self.lp, path, bytes)
+
+    /** A task that resolves `host` and `service` on libuv's thread pool, ending with every way the
+     * resolver found to reach it, in the order it prefers. `flags` takes libuv's `AI_` constants;
+     * `AI_NUMERICHOST` answers `EAI_NONAME` for a name rather than asking the network.
+     */
+    resolve(self, host: string, service: string = "", flags: i32 = 0) -> Task[Result[[]libuv.AddrInfo, Error]] =
+        resolve_on(self.lp, host, service, flags)
+end Uv
+
+/** A driver over libuv's default loop, which is what a program with one loop wants. */
+uv() -> &Uv = uv_on(libuv.default_loop())
+
+/** A driver over `lp`, a libuv loop of the program's own. */
+uv_on(lp: &libuv.Loop) -> &Uv =
+    // uv_timer_init only records the handle on the loop; it has no failure to answer.
+    Uv(lp, libuv.timer(lp).expect("a timer on an initialised loop"), monotonic())
+
+private const slice_ms: long = 1
+
+impl Driver for Uv
+    now(*self) -> Duration = monotonic() - self.origin
+
+    idle_until(*self, deadline: Option[Duration])
+        if signalled() then return
+
+        deadline match
+            Some(d) ->
+                val left = d - self.now()
+
+                if left <= millis(0)
+                    self.poll()
+                    return
+
+                // libuv's timers count whole milliseconds from the loop's cached clock: refresh it,
+                // and round up so the wait never ends before the deadline.
+                self.lp.update_time()
+                self.timer.start(u64((left.us + 999) / 1000), 0, nothing).expect("a stopped timer starts")
+                self.lp.run(libuv.RUN_ONCE).expect("libuv ran")
+                self.timer.stop().expect("a timer stops")
+            None ->
+                if self.lp.alive()
+                    self.lp.run(libuv.RUN_ONCE).expect("libuv ran")
+                else
+                    sleep(millis(slice_ms))
+    end idle_until
+
+    override busy(*self) -> bool = self.lp.alive()
+
+    override poll(*self)
+        self.lp.run(libuv.RUN_NOWAIT).expect("libuv ran")
+end Uv
+
+private nothing() = ()
+
+/** One operation's answer, and the waker of the task waiting for it.
+ *
+ * The libuv callback calls `finish`; the task's `park` calls `arm`. Whichever runs second is the one
+ * that wakes the task, so an answer that arrives during the start is not lost.
+ */
+private[uv] struct Pending[T]
+    result: Option[T]
+    wake: Option[&Fn() -> unit]
+    abandoned: bool
+
+    finish(*self, v: T)
+        self.result = Some(v)
+
+        self.wake match
+            Some(w) ->
+                self.wake = None
+                w()
+            None -> ()
+
+    arm(*self, w: &Fn() -> unit)
+        if self.result.is_some() then w() else self.wake = Some(w)
+
+    // Said by a `defer` on the way out: a callback still to come answers into nothing.
+    abandon(*self)
+        if self.result.is_none() then self.abandoned = true
+end Pending
+
+private[uv] pending[T]() -> &Pending[T] = Pending(None, None, false)
+
+/** Park until `p` has its answer, and take it. */
+private[uv] async settled[T](p: &Pending[T]) -> T
+    await park((w) -> p.arm(w))
+
+    p.result.expect("a park is woken only by its operation's answer")
+#endif

@@ -8,7 +8,10 @@
 //     }
 //
 // The module a program imports is `sh.sysl.kairos`; `sh.sysl.kairos.sim` is the simulated driver
-// the tests run on, and `sh.sysl.kairos.host` the real-time one for a laptop.
+// the tests run on, `sh.sysl.kairos.host` the real-time one for a laptop, and `sh.sysl.kairos.uv`
+// the libuv one, with sockets and files, behind the `uv` feature:
+//
+//     kairos { git = "github.com/sysl-lang/kairos", version = "0.1.0", features = [uv] }
 
 package {
   name    = "kairos"
@@ -26,4 +29,16 @@ package {
 // and it carries `@requires(posix)` on itself, so a board that never imports it never asks.
 requires {
   heap = true
+}
+
+// **`uv` is the one feature, and it is off unless a consumer asks for it**: it brings the libuv
+// driver, `sh.sysl.kairos.uv` -- `uv()`, TCP, whole files and name lookups -- and with it the
+// `libuv` package, which needs libuv installed (`brew install libuv`, Debian's `libuv1-dev`). With
+// it off, that module is empty and nothing of libuv is fetched, asked for or linked. It only adds.
+features {
+  uv = [libuv]
+}
+
+dependencies {
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.8", optional = true }
 }

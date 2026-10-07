@@ -55,10 +55,20 @@ signalled() -> bool = pending.load() != 0
  * means there is no timer, so only a signal can give the loop anything to do. A board implements it
  * as WFI with SysTick, or a one-shot timer compare, set for the deadline; it must return at once if
  * `signalled()` is already true.
+ *
+ * Two members have defaults, and only a driver that is itself a source of events overrides them --
+ * the libuv one, whose sockets and files wake tasks from inside `idle_until`. `busy` says it holds
+ * such work, which keeps the loop alive while a task waits on it. `poll` takes in whatever has already
+ * happened without waiting, and is called on a pass that does not idle, so a task that only yields
+ * cannot starve the driver's events.
  */
 trait Driver
     now(*self) -> Duration
     idle_until(*self, deadline: Option[Duration])
+
+    busy(*self) -> bool = false
+
+    poll(*self) = ()
 
 /** Why `Loop.on` refused a source. */
 enum SourceError
@@ -273,11 +283,14 @@ struct Loop[D: Driver]
     stop(*self)
         self.stopping = true
 
-    /** Whether anything is left that could ever run: a timer, a handle, a source or a woken task. */
+    /** Whether anything is left that could ever run: a timer, a handle, a source, a woken task, or
+     * work the driver holds.
+     */
     alive(self) -> bool
         if self.registered != 0 || self.timers.live > 0 then return true
+        if self.idles.live > 0 || self.checks.live > 0 || !self.ready.woken.is_empty() then return true
 
-        self.idles.live > 0 || self.checks.live > 0 || !self.ready.woken.is_empty()
+        self.driver.busy()
 
     /** How many tasks are spawned and not yet finished or cancelled, parked or woken. */
     running(self) -> usize = self.tasks.live
@@ -456,12 +469,14 @@ struct Loop[D: Driver]
     end drain
 
     private wait(*self)
-        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled() then return
+        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled()
+            self.driver.poll()
+            return
 
         val deadline = self.next_deadline()
 
         deadline match
-            Some(d) -> if d > self.driver.now() then self.driver.idle_until(deadline)
+            Some(d) -> if d > self.driver.now() then self.driver.idle_until(deadline) else self.driver.poll()
             None -> self.driver.idle_until(None)
     end wait
 end Loop

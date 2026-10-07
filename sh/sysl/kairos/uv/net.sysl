@@ -1,0 +1,194 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// TCP: a connection to read from and write to, and a listener to accept them from.
+//
+//     val l = io.listen(ip4("127.0.0.1", 0)?)?
+//     val conn = (await l.accept())?
+//     val got = (await conn.read())?          // empty at the end of the stream
+//     (await conn.write(got))?
+//
+// **libuv pushes and a task pulls.** A stream is read by starting libuv's reading, taking the first
+// chunk that arrives, and stopping again inside the callback -- so nothing arrives that no `read`
+// asked for, and a `read` that is dropped leaves the bytes in the kernel for the next one. That is
+// what lets `lp.timeout(d, conn.read())` give up on a read without losing what comes after.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{Handle, Stream}
+
+/** A connected TCP socket. Reached through `&Connection`; `close` ends it. */
+struct Connection
+    private sock: &libuv.Tcp
+    private reading: Option[&Pending[Result[[]u8, Error]]]
+
+    /** A task that ends with the next bytes the peer sent -- at most 64 KiB -- or with an empty
+     * slice once the peer has closed its half. Dropping it before it ends consumes nothing.
+     */
+    read(&self) -> Task[Result[[]u8, Error]] = read_from(self)
+
+    /** A task that ends when `bytes` have been handed to the kernel. The bytes are copied at the
+     * start, so the caller's slice need not outlive it.
+     */
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = write_to(self.sock, bytes)
+
+    /** The address of the other end. */
+    peer(self) -> Result[libuv.Address, Error]
+        val s = self.sock
+
+        Ok(s.peername()?)
+
+    /** Close the socket. A task still reading from it ends with `ECANCELED`. */
+    close(*self)
+        val s = self.sock
+
+        if !s.is_closing() then s.close()
+
+        self.reading match
+            Some(p) ->
+                self.reading = None
+                p.finish(Err(cancelled()))
+            None -> ()
+end Connection
+
+/** A listening socket. `accept` takes the next connection; `close` stops listening. */
+struct Listener
+    private sock: &libuv.Tcp
+    private arrived: usize
+    private closed: bool
+    private waiter: Option[&Pending[unit]]
+
+    /** A task that ends with the next connection. Dropping it leaves that connection queued for
+     * the next `accept`.
+     */
+    accept(&self) -> Task[Result[&Connection, Error]] = accept_from(self)
+
+    /** The port this listener holds, which is the one the kernel chose for a port of `0`. */
+    port(self) -> Result[int, Error]
+        val s = self.sock
+
+        Ok(s.sockname()?.port())
+
+    /** Stop listening. A task waiting in `accept` ends with `ECANCELED`. */
+    close(*self)
+        val s = self.sock
+
+        if !s.is_closing() then s.close()
+
+        self.closed = true
+
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+
+    // libuv's connection callback: one more is waiting, and a task may be waiting for it.
+    private ready(*self)
+        self.arrived += 1
+
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+end Listener
+
+private[uv] async connect_on(lp: &libuv.Loop, addr: libuv.Address) -> Result[&Connection, Error]
+    val s = libuv.tcp(lp)?
+    var connected = false
+    defer if !connected then s.close()
+
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    s.connect(addr, (r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    connected = true
+    Ok(Connection(s, None))
+
+private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int) -> Result[&Listener, Error]
+    val s = libuv.tcp(lp)?
+
+    s.bind(addr) match
+        Err(e) ->
+            s.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    var l: &Listener = Listener(s, 0, false, None)
+
+    s.listen(backlog, () -> l.ready()) match
+        Err(e) ->
+            s.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    Ok(l)
+end listen_on
+
+private async accept_from(l: &Listener) -> Result[&Connection, Error]
+    if l.arrived == 0
+        val p: &Pending[unit] = pending()
+
+        l.waiter = Some(p)
+        defer l.waiter = None
+        await settled(p)
+
+    if l.closed then return Err(cancelled())
+
+    l.arrived -= 1
+
+    val s = l.sock
+
+    Ok(Connection(s.accept()?, None))
+end accept_from
+
+private async read_from(c: &Connection) -> Result[[]u8, Error]
+    val s = c.sock
+
+    if s.is_closing() then return Err(cancelled())
+
+    val p: &Pending[Result[[]u8, Error]] = pending()
+
+    s.read_start((r) ->
+        s.read_stop()
+        p.finish(r match
+            libuv.Data(bytes) -> Ok(copy_of(bytes))
+            libuv.End -> Ok([0; 0])
+            libuv.Failed(e) -> Err(e)))?
+
+    c.reading = Some(p)
+    defer stop_reading(c)
+
+    await settled(p)
+end read_from
+
+private stop_reading(c: &Connection)
+    val s = c.sock
+
+    c.reading = None
+    if !s.is_closing() then s.read_stop()
+
+// What a task waiting on a socket that was closed under it ends with.
+private cancelled() -> Error = libuv.Error(libuv.ECANCELED)
+
+private async write_to(s: &libuv.Tcp, bytes: []const u8) -> Result[unit, Error]
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    s.write(bytes, (r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    Ok(())
+
+private copy_of(bytes: []const u8) -> []u8
+    var out: []u8 = [0; bytes.len]
+
+    for i in 0..<bytes.len do out[i] = bytes[i]
+
+    out
+#endif

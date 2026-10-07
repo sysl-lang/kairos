@@ -159,6 +159,9 @@ the handles — lives on the `Loop`, and runs on the loop's side.
 trait Driver
     now(*self) -> Duration
     idle_until(*self, deadline: Option[Duration])
+
+    busy(*self) -> bool = false
+    poll(*self) = ()
 ```
 
 The machine is a value chosen in code — `event_loop(host())`, `event_loop(sim())`, a board's — and the
@@ -170,7 +173,11 @@ return early for any reason; `None` means no timer is pending, so only an interr
 work. **It must return at once if `signalled()` is already true** — the loop checks before calling,
 but an interrupt can land between that check and the sleep.
 
-Two ship:
+`busy` and `poll` matter only to a driver that is itself a source of events, which today is the
+libuv one: `busy` keeps the loop alive while the driver holds work a task waits on, and `poll` takes
+in what has already happened, on a pass that does not idle.
+
+Two ship in the core, and a third behind the `uv` feature ([below](#the-uv-feature-libuv-sockets-and-files)):
 
 - **`sh.sysl.kairos.sim`** — a manual clock for tests. `idle_until` jumps the clock to the deadline,
   or to the first interrupt scheduled with `irq_at(t, n)` before it, raises that source with `signal`,
@@ -195,8 +202,61 @@ closes the window between the loop's last look and the sleep.
   priority interrupt beside the background one) are a later version, as further `Loop`s over the
   same trait.
 - **No board driver.** It comes with the hardware (an STM32H747) and is described above.
-- **No libuv driver yet.** A `Driver` over `sh.sysl.libuv` gives the same API on a desktop with real
-  I/O; it is to come behind one opt-in `uv` feature, so a board's link line never carries `-luv`.
+
+## The `uv` feature: libuv, sockets and files
+
+One feature, off unless asked for. It brings the `libuv` package (so libuv has to be installed —
+`brew install libuv`, Debian's `libuv1-dev`) and the module `sh.sysl.kairos.uv`; with it off that
+module is empty and nothing of libuv is fetched or linked, so a board's link line never carries
+`-luv`. It only adds.
+
+```hocon
+dependencies {
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.0", features = [uv] }
+}
+```
+
+The machine is still a driver value — `uv()` over libuv's default loop, `uv_on(lp)` over one of the
+program's own — and its I/O is tasks, awaited beside `sleep`, `wait_for` and `timeout`:
+
+```sysl
+import sh.sysl.kairos.event_loop
+import sh.sysl.kairos.uv.{uv, Uv, Listener}
+import sh.sysl.libuv.ip4
+
+async echo(l: &Listener)
+    val conn = (await l.accept()).expect("a connection")
+    val got = (await conn.read()).expect("bytes")      // empty once the peer has closed
+
+    (await conn.write(got)).expect("written back")
+    conn.close()
+    l.close()
+
+val io = uv()
+val lp = event_loop(io)
+val l = io.listen(ip4("127.0.0.1", 0).expect("an address")).expect("listening")
+
+lp.spawn(echo(l))
+lp.run()
+```
+
+| | |
+|---|---|
+| `io.connect(addr)` | a task ending with a `&Connection`, or `ECONNREFUSED` |
+| `io.listen(addr)` | a `&Listener` at once; `l.accept()` is a task, `l.port()` the port the kernel chose |
+| `conn.read()`, `conn.write(bytes)` | tasks; a dropped read consumes nothing, so `lp.timeout(d, conn.read())` loses no bytes |
+| `io.read_file(path)`, `io.write_file(path, bytes)` | whole files, on libuv's thread pool |
+| `io.resolve(host, service)` | a name lookup, on the thread pool |
+
+A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection
+or a listener ends a task waiting on it with `ECANCELED`.
+
+`idle_until` runs libuv once, with a libuv timer set for the deadline, so a socket wakes the loop as
+a source does. `busy` is libuv's own answer to whether its loop is alive — an open listener, a read
+or request in flight, a handle still closing — so `run` drains closes before it returns, and a task
+waiting on nothing libuv watches is still cancelled when nothing else is left. A `signal` from another
+thread is noticed at libuv's next event or deadline, or within a millisecond when libuv has nothing
+to wait for.
 
 ## What it needs
 
@@ -275,13 +335,18 @@ compile time and costs nothing at run time.
 ## Testing
 
 ```
-sysl test .
-SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
+sysl test . --no-default-features
+sysl test . --features uv
+SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test . --features uv
 ```
 
-Every test but one runs on the simulated driver: deterministic, no real sleeping, each asserting a
-whole timeline of what ran and when, and the deadlines `idle_until` was handed. The one on the host
-driver checks that two sleeps take at least their sum of real time.
+`sysl test .` on its own turns every feature on. The core's tests run on the simulated driver:
+deterministic, no real sleeping, each asserting a whole timeline of what ran and when, and the
+deadlines `idle_until` was handed; one on the host driver checks that two sleeps take at least their
+sum of real time. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
+refusal (`ECONNREFUSED`, `EADDRINUSE`, `ENOENT`, `EAI_NONAME`, `ECANCELED` on a close), a timeout
+around a read nothing answers, cancellation by drop, and a yielding task that must not starve libuv.
+ASan instruments the sysl half only: libuv is a `pkg_config` library someone else compiled.
 
 ## License
 

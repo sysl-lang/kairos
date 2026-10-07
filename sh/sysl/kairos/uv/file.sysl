@@ -1,0 +1,101 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Whole files, read and written on libuv's thread pool.
+//
+// Each step -- open, every read or write, close -- is its own request, awaited in turn, so a task
+// dropped between two of them stops there and the file it had open is closed on the way out.
+//
+// **A request already on the thread pool runs to its end**: libuv cannot interrupt one. Its answer
+// lands in a cell nothing reads any more, and a file an abandoned open produced is closed there.
+
+import sh.sysl.libuv
+import sysl.buf.{Buf, buf}
+
+private const chunk_size: usize = 65536
+
+private[uv] async read_file_on(lp: &libuv.Loop, path: string) -> Result[[]u8, Error]
+    val f = (await open_on(lp, path, libuv.O_RDONLY))?
+    var open = true
+    defer if open then libuv.close(f, ignore, lp)
+
+    var out: Buf[u8] = buf()
+
+    loop
+        val chunk = (await read_on(lp, f))?
+
+        if chunk.len == 0 then break
+
+        out.extend(chunk)
+
+    open = false
+    (await close_on(lp, f))?
+    Ok(out.view())
+end read_file_on
+
+private[uv] async write_file_on(lp: &libuv.Loop, path: string, bytes: []const u8) -> Result[unit, Error]
+    val flags = libuv.O_WRONLY | libuv.O_CREAT | libuv.O_TRUNC
+    val f = (await open_on(lp, path, flags))?
+    var open = true
+    defer if open then libuv.close(f, ignore, lp)
+
+    var done: usize = 0
+
+    while done < bytes.len
+        done += (await write_on(lp, f, bytes[done..]))?
+
+    open = false
+    (await close_on(lp, f))?
+    Ok(())
+end write_file_on
+
+private async open_on(lp: &libuv.Loop, path: string, flags: i32) -> Result[libuv.File, Error]
+    val p: &Pending[Result[libuv.File, Error]] = pending()
+    defer p.abandon()
+
+    libuv.open(path, (r) -> opened(p, r, lp), flags, 420, lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+// An open nobody waits for any more still produced a descriptor, and it is closed here.
+private opened(p: &Pending[Result[libuv.File, Error]], r: Result[libuv.File, Error], lp: &libuv.Loop)
+    if !p.abandoned
+        p.finish(r)
+        return
+
+    r match
+        Ok(f) -> libuv.close(f, ignore, lp)
+        Err(_) -> ()
+
+private async read_on(lp: &libuv.Loop, f: libuv.File) -> Result[[]u8, Error]
+    val p: &Pending[Result[[]u8, Error]] = pending()
+
+    libuv.read(f, chunk_size, (r) -> p.finish(r), -1, lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+private async write_on(lp: &libuv.Loop, f: libuv.File, bytes: []const u8) -> Result[usize, Error]
+    val p: &Pending[Result[usize, Error]] = pending()
+
+    libuv.write(f, bytes, (r) -> p.finish(r), -1, lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+private async close_on(lp: &libuv.Loop, f: libuv.File) -> Result[unit, Error]
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    libuv.close(f, (r) -> p.finish(r), lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+private ignore(r: Result[unit, Error]) -> unit = ()
+#endif

@@ -1,0 +1,461 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// The libuv driver end to end: timers and interleaving on a real clock, a TCP echo over the loopback,
+// files, name lookups, cancellation by drop and by timeout, and the failure each operation can
+// answer with.
+//
+// **Every network test asks the kernel for a port** (`ip4("127.0.0.1", 0)`), so nothing here can
+// collide with a service on the machine, and every file test writes under the system's temporary
+// directory with a name of its own. No lookup asks the network: each is numeric.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.ip4
+import sh.sysl.kairos.{Loop, Stalled, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.millis
+
+private struct Log
+    lines: Buf[string]
+
+private log() -> &Log = Log(buf())
+
+private struct Count
+    n: int
+
+private count() -> &Count = Count(0)
+
+private local(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+private text(bytes: []const u8) -> string = from_utf8_lossy(bytes)
+
+private scratch(name: string) -> string = s"/tmp/sysl-kairos-uv-test-$name"
+
+private async nap(lp: &Loop[Uv], ms: long, name: string, l: &Log)
+    await lp.sleep(millis(ms))
+    l.lines.push(name)
+
+@test("timers end in the order they are due, not the order they were started")
+timers_end_in_order()
+    val lp = event_loop(uv())
+    val l = log()
+
+    lp.spawn(nap(lp, 30, "thirty", l))
+    lp.spawn(nap(lp, 10, "ten", l))
+    lp.spawn(nap(lp, 20, "twenty", l))
+    lp.run()
+
+    assert_eq(l.lines.view(), ["ten", "twenty", "thirty"])
+    assert_eq(lp.running(), 0)
+
+@test("a sleep waits at least as long as it was asked to, on the real clock")
+a_sleep_waits()
+    val io = uv()
+    val lp = event_loop(io)
+    val start = io.now()
+
+    lp.block_on(lp.sleep(millis(25))).expect("slept")
+    assert(io.now() - start >= millis(25), "the driver's clock moved by the sleep")
+
+private async counter(name: string, rounds: int, l: &Log)
+    for i in 0..<rounds
+        l.lines.push(s"$name$i")
+        await yield_now()
+
+@test("two tasks that yield take turns")
+yielding_tasks_interleave()
+    val lp = event_loop(uv())
+    val l = log()
+
+    lp.spawn(counter("a", 3, l))
+    lp.spawn(counter("b", 3, l))
+    lp.run()
+
+    assert_eq(l.lines.view(), ["a0", "b0", "a1", "b1", "a2", "b2"])
+
+@test("a task that sleeps lets the other run, and resumes when its timer fires")
+sleeping_tasks_interleave()
+    val lp = event_loop(uv())
+    val l = log()
+
+    lp.spawn(nap(lp, 20, "slow", l))
+    lp.spawn(counter("fast", 2, l))
+    lp.run()
+
+    assert_eq(l.lines.view(), ["fast0", "fast1", "slow"])
+
+private async answer(lp: &Loop[Uv]) -> int
+    await lp.sleep(millis(1))
+    42
+
+@test("block_on runs one task to its value, beside what was spawned")
+block_on_answers()
+    val lp = event_loop(uv())
+    val l = log()
+
+    lp.spawn(nap(lp, 50, "late", l))
+    assert_eq(lp.block_on(answer(lp)).expect("ran"), 42)
+    assert(l.lines.is_empty(), "block_on returned without waiting for the other task")
+
+    lp.run()
+    assert_eq(l.lines.view(), ["late"])
+
+private async echo_once(l: &Listener)
+    val conn = (await l.accept()).expect("a connection")
+    val got = (await conn.read()).expect("bytes")
+
+    (await conn.write(got)).expect("written back")
+    conn.close()
+    l.close()
+
+private async ask(io: &Uv, port: int, message: string) -> (string, usize)
+    val conn = (await io.connect(local(port))).expect("connected")
+
+    (await conn.write(message.bytes)).expect("written")
+
+    val reply = (await conn.read()).expect("the echo")
+    val after = (await conn.read()).expect("the end")
+
+    conn.close()
+    (text(reply), after.len)
+
+@test("a TCP echo: server and client are two tasks on one loop")
+tcp_echo_round_trip()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    lp.spawn(echo_once(l))
+
+    val (reply, after) = lp.block_on(ask(io, port, "hello, loop")).expect("ran")
+
+    assert_eq(reply, "hello, loop")
+    assert_eq(after, 0)
+    lp.run()
+    assert_eq(lp.running(), 0)
+    assert(!io.on_loop().alive(), "the server closed everything it opened")
+
+@test("connecting where nothing listens is ECONNREFUSED")
+connect_refused()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    l.close()
+    lp.run()
+
+    lp.block_on(io.connect(local(port))).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ECONNREFUSED")
+        Ok(_) -> assert(false, "connected to a port nobody holds")
+
+@test("listening on a port somebody holds is EADDRINUSE")
+listen_in_use()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    io.listen(local(port)) match
+        Err(e) -> assert_eq(e.name(), "EADDRINUSE")
+        Ok(_) -> assert(false, "two listeners on one port")
+
+    l.close()
+    lp.run()
+
+@test("an accept waiting when its listener closes ends with ECANCELED")
+accept_on_closed_listener()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val t = l.accept()
+    val heard = count()
+
+    assert(!step(t, () -> heard.n += 1), "the accept waits")
+    l.close()
+    assert_eq(heard.n, 1)
+
+    block_on(t) match
+        Err(e) -> assert_eq(e.name(), "ECANCELED")
+        Ok(_) -> assert(false, "an accept on a closed listener answered a connection")
+
+    lp.run()
+
+private async reset_on_accept(l: &Listener)
+    val conn = (await l.accept()).expect("a connection")
+
+    conn.close()
+    l.close()
+
+private async write_until_refused(io: &Uv, lp: &Loop[Uv], port: int) -> Option[Error]
+    val conn = (await io.connect(local(port))).expect("connected")
+    var failed: Option[Error] = None
+
+    for i in 0..<200
+        (await conn.write([7; 65536])) match
+            Err(e) ->
+                failed = Some(e)
+                break
+            Ok(_) -> await lp.sleep(millis(1))
+
+    conn.close()
+    failed
+end write_until_refused
+
+@test("writing to a connection the peer has closed fails")
+write_to_closed_peer()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    lp.spawn(reset_on_accept(l))
+
+    val failed = lp.block_on(write_until_refused(io, lp, port)).expect("ran")
+
+    assert(failed.is_some(), "a write to a closed peer was refused")
+    lp.run()
+
+@test("a read on a connection closed under it ends with ECANCELED")
+read_on_closed_connection()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    lp.spawn(reset_on_accept(l))
+
+    val conn = lp.block_on(io.connect(local(port))).expect("ran").expect("connected")
+    val t = conn.read()
+
+    assert(!step(t, () -> ()), "the read waits")
+    conn.close()
+
+    block_on(t) match
+        Err(e) -> assert_eq(e.name(), "ECANCELED")
+        Ok(_) -> assert(false, "a read on a closed connection answered bytes")
+
+    lp.run()
+
+@test("a timeout around a read that never arrives ends with None, and the bytes sent later are kept")
+timeout_on_a_silent_read()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val client = lp.block_on(io.connect(local(port))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+    val start = io.now()
+
+    assert(lp.block_on(lp.timeout(millis(30), server.read())).expect("ran").is_none(), "nothing arrived")
+    assert(io.now() - start >= millis(30), "the timeout waited its deadline")
+
+    lp.block_on(client.write("late".bytes)).expect("ran").expect("written")
+
+    val got = lp.block_on(lp.timeout(millis(5000), server.read())).expect("ran")
+
+    assert_eq(text(got.expect("in time").expect("read")), "late")
+
+    client.close()
+    server.close()
+    l.close()
+    lp.run()
+end timeout_on_a_silent_read
+
+private struct Spin
+    done: bool
+    rounds: int
+
+private async spin_until_done(s: &Spin)
+    while !s.done && s.rounds < 1000000
+        s.rounds += 1
+        await yield_now()
+
+private async connect_then_finish(io: &Uv, port: int, s: &Spin) -> bool
+    val conn = await io.connect(local(port))
+
+    s.done = true
+    conn.is_ok()
+
+@test("a task that only yields does not starve libuv: a connect beside it completes")
+yielding_does_not_starve_io()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val s: &Spin = Spin(false, 0)
+
+    lp.spawn(spin_until_done(s))
+    assert(lp.block_on(connect_then_finish(io, port, s)).expect("ran"), "connected")
+    assert(s.rounds < 1000000, "the connect completed while the other task was still yielding")
+
+    l.close()
+    lp.run()
+end yielding_does_not_starve_io
+
+@test("a file written is read back byte for byte")
+file_round_trip()
+    val io = uv()
+    val lp = event_loop(io)
+    val path = scratch("round-trip")
+    var big: Buf[u8] = buf()
+
+    for i in 0..<200000 do big.push(u8(i % 251))
+
+    lp.block_on(io.write_file(path, big.view())).expect("ran").expect("written")
+
+    val back = lp.block_on(io.read_file(path)).expect("ran").expect("read")
+
+    assert_eq(back.len, 200000)
+    assert(back == big.view(), "every byte came back")
+
+    lp.block_on(io.write_file(path, "short".bytes)).expect("ran").expect("rewritten")
+    assert_eq(text(lp.block_on(io.read_file(path)).expect("ran").expect("read")), "short")
+    libuv.unlink_sync(path).expect("removed")
+end file_round_trip
+
+@test("reading a file that is not there is ENOENT")
+read_missing_file()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(io.read_file(scratch("not-there"))).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ENOENT")
+        Ok(_) -> assert(false, "a missing file was read")
+
+@test("writing a file into a directory that is not there is ENOENT")
+write_missing_directory()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(io.write_file(scratch("no-such-dir/f"), "x".bytes)).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ENOENT")
+        Ok(_) -> assert(false, "a file was written into nothing")
+
+@test("a numeric lookup answers the address and port it was given")
+resolve_numeric()
+    val io = uv()
+    val lp = event_loop(io)
+    val found = lp.block_on(io.resolve("127.0.0.1", "8080", libuv.AI_NUMERICHOST)).expect("ran").expect("resolved")
+
+    assert_eq(found.len, 1)
+    assert_eq(found[0].address.port(), 8080)
+    assert_eq(found[0].family, libuv.AF_INET)
+
+@test("a name where only a number is allowed is EAI_NONAME, without asking the network")
+resolve_refused()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(io.resolve("not a number", "", libuv.AI_NUMERICHOST)).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "EAI_NONAME")
+        Ok(_) -> assert(false, "a name was resolved as a number")
+
+private struct Stuck
+    p: &Pending[unit]
+
+private async never_answered(s: &Stuck)
+    await settled(s.p)
+
+@test("a task parked on nothing libuv watches is reported as stalled, not waited on for ever")
+a_stalled_task_is_reported()
+    val lp = event_loop(uv())
+
+    lp.block_on(never_answered(Stuck(pending()))) match
+        Err(Stalled(n)) -> assert_eq(n, 1)
+        _ -> assert(false, "a task nothing can wake was reported as finished")
+
+    assert_eq(lp.running(), 0)
+
+private stepped_then_dropped[T](t: Task[T], heard: &Count)
+    assert(!step(t, () -> heard.n += 1), "the task parked")
+
+@test("a dropped sleep cancels its timer: the waker never fires and the loop does not wait for it")
+dropping_a_sleep_cancels_it()
+    val io = uv()
+    val lp = event_loop(io)
+    val heard = count()
+    val start = io.now()
+
+    stepped_then_dropped(lp.sleep(millis(300)), heard)
+    lp.run()
+
+    assert_eq(heard.n, 0)
+    assert(io.now() - start < millis(300), "the loop did not wait for the dropped timer")
+    assert(!io.on_loop().alive(), "nothing of the sleep is left on libuv's loop")
+
+@test("a dropped read consumes nothing: the bytes go to the next read, and its waker never fires")
+dropping_a_read_cancels_it()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val client = lp.block_on(io.connect(local(port))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+    val heard = count()
+
+    stepped_then_dropped(server.read(), heard)
+    lp.block_on(client.write("kept".bytes)).expect("ran").expect("written")
+    lp.block_on(lp.sleep(millis(20))).expect("slept")
+
+    assert_eq(heard.n, 0)
+    assert_eq(text(lp.block_on(server.read()).expect("ran").expect("read")), "kept")
+
+    client.close()
+    server.close()
+    l.close()
+    lp.run()
+end dropping_a_read_cancels_it
+
+@test("a dropped accept leaves the connection queued for the next accept")
+dropping_an_accept_cancels_it()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val heard = count()
+
+    stepped_then_dropped(l.accept(), heard)
+
+    val client = lp.block_on(io.connect(local(port))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+
+    assert_eq(heard.n, 0)
+    assert(server.peer().is_ok(), "the queued connection was accepted")
+
+    client.close()
+    server.close()
+    l.close()
+    lp.run()
+end dropping_an_accept_cancels_it
+
+private async sleeper(lp: &Loop[Uv], l: &Log)
+    defer l.lines.push("cleaned up")
+    await lp.sleep(millis(10000))
+    l.lines.push("woke")
+
+private async first_of(lp: &Loop[Uv], l: &Log)
+    val slow = sleeper(lp, l)
+    val heard = count()
+
+    assert(!step(slow, () -> heard.n += 1), "the slow task parked")
+    await lp.sleep(millis(5))
+    l.lines.push("gave up")
+
+@test("a task dropped by the task that made it runs its cleanup and nothing after its await")
+dropped_inside_a_task()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = log()
+    val start = io.now()
+
+    lp.block_on(first_of(lp, l)).expect("ran")
+    assert_eq(l.lines.view(), ["gave up", "cleaned up"])
+
+    lp.run()
+    assert(io.now() - start < millis(10000), "the dropped sleep left no timer behind to wait for")
+#endif
