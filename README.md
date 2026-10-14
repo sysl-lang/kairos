@@ -9,11 +9,11 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.2" }
 }
 ```
 
-kairos needs sysl 0.1.0-alpha.2 or later: `brew install sysl-lang/tap/sysl`.
+kairos needs sysl 0.1.0-alpha.11 or later: `brew install sysl-lang/tap/sysl`.
 
 ```sysl
 import sh.sysl.kairos.{event_loop, signal}
@@ -214,7 +214,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.1", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.2", features = [uv] }
 }
 ```
 
@@ -247,11 +247,15 @@ lp.run()
 | `io.connect(addr)` | a task ending with a `&Connection`, or `ECONNREFUSED` |
 | `io.listen(addr)` | a `&Listener` at once; `l.accept()` is a task, `l.port()` the port the kernel chose |
 | `conn.read()`, `conn.write(bytes)` | tasks; a dropped read consumes nothing, so `lp.timeout(d, conn.read())` loses no bytes |
+| `conn.shutdown()` | a task; closes this side's half once queued writes have gone, so the peer reads the end while it can still answer |
+| `conn.nodelay(on)` | Nagle's algorithm off (`true`) or on |
 | `io.read_file(path)`, `io.write_file(path, bytes)` | whole files, on libuv's thread pool |
 | `io.resolve(host, service)` | a name lookup, on the thread pool |
 
 A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection
-or a listener ends a task waiting on it with `ECANCELED`.
+or a listener ends a task waiting on it with `ECANCELED`. Closing twice does nothing, and a connection
+or listener dropped without being closed is closed then, so a forgotten `close` leaks no descriptor
+and does not keep the loop alive.
 
 `idle_until` runs libuv once, with a libuv timer set for the deadline, so a socket wakes the loop as
 a source does. `busy` is libuv's own answer to whether its loop is alive — an open listener, a read

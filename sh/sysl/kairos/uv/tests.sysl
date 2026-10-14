@@ -12,7 +12,7 @@ module sh.sysl.kairos.uv
 // directory with a name of its own. No lookup asks the network: each is numeric.
 
 import sh.sysl.libuv
-import sh.sysl.libuv.ip4
+import sh.sysl.libuv.{Handle, ip4}
 import sh.sysl.kairos.{Loop, Stalled, event_loop}
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_lossy
@@ -458,4 +458,164 @@ dropped_inside_a_task()
 
     lp.run()
     assert(io.now() - start < millis(10000), "the dropped sleep left no timer behind to wait for")
+
+// A connected pair over the loopback, the client first.
+private pair(io: &Uv, lp: &Loop[Uv], l: &Listener) -> (&Connection, &Connection)
+    val client = lp.block_on(io.connect(local(l.port().expect("a port")))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+
+    (client, server)
+
+@test("after a shutdown the peer reads the end of the stream, and can still answer")
+shutdown_half_closes()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val (client, server) = pair(io, lp, l)
+
+    lp.block_on(client.write("last".bytes)).expect("ran").expect("written")
+    lp.block_on(client.shutdown()).expect("ran").expect("shut down")
+    assert_eq(text(lp.block_on(server.read()).expect("ran").expect("read")), "last")
+    assert_eq(lp.block_on(server.read()).expect("ran").expect("the end").len, 0)
+
+    lp.block_on(server.write("answer".bytes)).expect("ran").expect("the peer can still write")
+    assert_eq(text(lp.block_on(client.read()).expect("ran").expect("read")), "answer")
+
+    client.close()
+    server.close()
+    l.close()
+    lp.run()
+end shutdown_half_closes
+
+@test("shutting down twice, or after closing, is ENOTCONN")
+shutdown_refused()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val (client, server) = pair(io, lp, l)
+
+    lp.block_on(client.shutdown()).expect("ran").expect("shut down")
+
+    lp.block_on(client.shutdown()).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ENOTCONN")
+        Ok(_) -> assert(false, "a second shutdown was accepted")
+
+    server.close()
+
+    lp.block_on(server.shutdown()).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ENOTCONN")
+        Ok(_) -> assert(false, "a shutdown of a closed connection was accepted")
+
+    client.close()
+    l.close()
+    lp.run()
+end shutdown_refused
+
+extern "getsockopt" getsockopt(fd: i32, level: i32, name: i32, value: *i32, len: *u32) -> i32
+
+// What the kernel says TCP_NODELAY is on this connection's socket. `IPPROTO_TCP` is 6 and
+// `TCP_NODELAY` 1 on both Darwin and Linux.
+private nagle_off(c: &Connection) -> bool
+    val s = c.sock
+    var on: i32 = 0
+    var len: u32 = 4
+
+    assert_eq(getsockopt(s.fileno().expect("a descriptor"), 6, 1, &on, &len), 0)
+    on != 0
+
+@test("nodelay turns Nagle off and on, as the kernel reports it")
+nodelay_reaches_the_socket()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val (client, server) = pair(io, lp, l)
+
+    client.nodelay(true).expect("nagle off")
+    assert(nagle_off(client), "TCP_NODELAY is set")
+    assert(!nagle_off(server), "and only on the connection it was asked of")
+
+    client.nodelay(false).expect("nagle on")
+    assert(!nagle_off(client), "TCP_NODELAY is clear again")
+
+    client.close()
+    server.close()
+    l.close()
+    lp.run()
+end nodelay_reaches_the_socket
+
+extern "dup" dup(fd: i32) -> i32
+extern "close" close_fd(fd: i32) -> i32
+
+// The descriptor the kernel would hand out next: the lowest one free, so it rises with every
+// descriptor left open.
+private next_fd() -> i32
+    val fd = dup(2)
+
+    assert(fd >= 0, "a descriptor to probe with")
+    close_fd(fd)
+    fd
+
+// Run libuv's own loop without waiting until the closes it was asked for have finished. Not
+// `lp.run()`: a handle left open would make that wait for ever rather than fail.
+private settle(io: &Uv)
+    for i in 0..<10 do io.on_loop().run(libuv.RUN_NOWAIT).expect("ran")
+
+// `rounds` connections made and accepted, every one of them -- and the listener -- dropped unclosed.
+private serve_and_drop(io: &Uv, lp: &Loop[Uv], rounds: int)
+    val l = io.listen(local(0)).expect("listening")
+
+    for i in 0..<rounds do pair(io, lp, l)
+
+// libuv opens a descriptor of its own the first time the loop runs, so the count is taken after one
+// round has warmed it: what is measured is that more rounds leave it where it was.
+@test("listeners dropped unclosed close, and leave nothing on the loop")
+dropping_a_listener_closes_it()
+    val io = uv()
+    val lp = event_loop(io)
+
+    serve_and_drop(io, lp, 0)
+    settle(io)
+    assert(!io.on_loop().alive(), "the listener's socket was closed")
+
+    val before = next_fd()
+
+    for i in 0..<20 do serve_and_drop(io, lp, 0)
+    settle(io)
+
+    assert(!io.on_loop().alive(), "every listener's socket was closed")
+    assert_eq(next_fd(), before)
+
+@test("connections dropped unclosed close: over many, no handle and no descriptor is left")
+dropping_connections_closes_them()
+    val io = uv()
+    val lp = event_loop(io)
+
+    serve_and_drop(io, lp, 1)
+    settle(io)
+
+    val before = next_fd()
+
+    serve_and_drop(io, lp, 100)
+    settle(io)
+
+    assert(!io.on_loop().alive(), "every socket was closed")
+    assert_eq(next_fd(), before)
+
+@test("closing twice, and dropping what was closed, is safe")
+closing_twice()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(local(0)).expect("listening")
+    val (client, server) = pair(io, lp, l)
+
+    client.close()
+    client.close()
+    server.close()
+    l.close()
+    l.close()
+    lp.run()
+    server.close()
+
+    assert(!io.on_loop().alive(), "everything closed once")
+end closing_twice
 #endif
