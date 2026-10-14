@@ -1,0 +1,144 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Child processes, started by libuv and reaped by its loop.
+//
+//     val p = io.spawn("/bin/cat", [], stdin = Piped, stdout = Piped)?
+//     (await p.stdin().expect("piped").write("hello".bytes))?
+//     p.stdin().expect("piped").close()
+//     val got = (await p.stdout().expect("piped").read())?
+//     val exit = await p.exit()                    // its status, or the signal that ended it
+//
+// **Dropping a `Process` does not kill the child.** Its handle stays on the loop until the child
+// exits, and is closed then: a dropped child keeps the loop running as a running one does, and
+// leaves nothing behind once it has gone. What it was piped to closes with it, unless a task still
+// holds the pipe.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sysl.buf.{Buf, buf}
+
+/** What one of the child's standard streams is. */
+enum Stdio
+    /** This process's own descriptor of the same number, which is what a shell does. */
+    Inherit
+
+    /** A pipe, whose other end is `stdin()`, `stdout()` or `stderr()` on the `Process`. */
+    Piped
+
+    /** Nothing: a read is the end of the stream at once, and a write goes nowhere. */
+    Ignore
+
+/** How a child ended: its exit status, or the signal that ended it -- one of the two is zero. */
+struct Exit
+    status: i64
+    signal: i32
+
+/** A child process. Reached through `&Process`. */
+struct Process
+    private child: &libuv.Process
+    private ended: Option[Exit]
+    private waiter: Option[&Pending[unit]]
+    private input: Option[&Pipe]
+    private output: Option[&Pipe]
+    private errors: Option[&Pipe]
+
+    /** The child's process id. */
+    pid(self) -> i32
+        val c = self.child
+
+        c.pid()
+
+    /** Send the child a signal: `SIGTERM` asks it to stop and `SIGKILL` does not ask. `ESRCH` once it
+     * has exited, so a signal never reaches a process that has taken over its id.
+     */
+    kill(self, signum: i32) -> Result[unit, Error]
+        if self.ended.is_some() then return Err(libuv.Error(libuv.EINVAL))
+
+        val c = self.child
+
+        Ok(c.kill(signum)?)
+
+    /** The pipe to the child's standard input, if it was `Piped`. Closing it is the end of the input. */
+    stdin(self) -> Option[&Pipe] = self.input
+
+    /** The pipe from the child's standard output, if it was `Piped`. */
+    stdout(self) -> Option[&Pipe] = self.output
+
+    /** The pipe from the child's standard error, if it was `Piped`. */
+    stderr(self) -> Option[&Pipe] = self.errors
+
+    /** A task that ends when the child has exited, with how it ended -- at once if it already has.
+     * One task waits at a time; dropping it leaves the child running.
+     */
+    exit(&self) -> Task[Exit] = exit_of(self)
+
+    // libuv's exit callback: the child has gone, so the handle can go too.
+    private exited(*self, e: Exit)
+        self.ended = Some(e)
+        close_handle(self.child)
+
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+end Process
+
+// Every handle here that is not a stream closes through this, so closing twice is safe.
+private[uv] close_handle[H: Handle](h: &H)
+    if !h.is_closing() then h.close(nothing)
+
+private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: []const string,
+                     cwd: string, stdin: Stdio, stdout: Stdio, stderr: Stdio) -> Result[&Process, Error]
+    var slots: Buf[libuv.Stdio] = buf()
+
+    // Each pipe is a `Pipe` from the start, so one that a failed spawn leaves behind is closed as it
+    // is dropped.
+    val input = slot(lp, stdin, 0, libuv.READABLE_PIPE, slots)?
+    val output = slot(lp, stdout, 1, libuv.WRITABLE_PIPE, slots)?
+    val errors = slot(lp, stderr, 2, libuv.WRITABLE_PIPE, slots)?
+
+    val child = libuv.spawn(file, args, ignore_exit, slots.view(), cwd, env, 0, lp)?
+    var p: &Process = Process(child, None, None, input, output, errors)
+
+    // Weak, or the handle -- which the loop holds until it is closed -- would hold the process, and a
+    // process nobody holds any more would never go. Once it has, the exit closes the handle alone.
+    val held: weak Process = p
+
+    child.on_exit((status, signal) -> held.get() match
+        Some(it) -> it.exited(Exit(status, signal))
+        None -> close_handle(child))
+
+    Ok(p)
+end spawn_on
+
+private ignore_exit(status: i64, signal: i32) -> unit = ()
+
+// One of the child's descriptors. `flags` is the pipe's direction from the child's side.
+private slot(lp: &libuv.Loop, s: Stdio, fd: i32, flags: i32, slots: Buf[libuv.Stdio]) -> Result[Option[&Pipe], Error]
+    s match
+        Inherit ->
+            slots.push(libuv.InheritFd(fd))
+            Ok(None)
+        Ignore ->
+            slots.push(libuv.Ignore)
+            Ok(None)
+        Piped ->
+            val p = libuv.pipe(false, lp)?
+
+            slots.push(libuv.ToPipe(p, flags))
+            Ok(Some(piped(p)))
+end slot
+
+private async exit_of(p: &Process) -> Exit
+    if p.ended.is_none()
+        val w: &Pending[unit] = pending()
+
+        p.waiter = Some(w)
+        defer p.waiter = None
+        await settled(w)
+
+    p.ended.expect("a waiter is woken only by the exit")
+#endif

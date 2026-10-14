@@ -2,7 +2,8 @@ module sh.sysl.kairos.uv
 #if feature_uv
 @requires(posix)
 
-// Whole files, read and written on libuv's thread pool.
+// The file system on libuv's thread pool: whole files, a `File` read and written a piece at a time,
+// and `stat`, `scandir`, `mkdir`, `rmdir`, `unlink`, `rename` and `chmod`.
 //
 // Each step -- open, every read or write, close -- is its own request, awaited in turn, so a task
 // dropped between two of them stops there and the file it had open is closed on the way out.
@@ -70,19 +71,21 @@ private opened(p: &Pending[Result[libuv.File, Error]], r: Result[libuv.File, Err
         Ok(f) -> libuv.close(f, ignore, lp)
         Err(_) -> ()
 
-private async read_on(lp: &libuv.Loop, f: libuv.File) -> Result[[]u8, Error]
+private async read_on(lp: &libuv.Loop, f: libuv.File, length: usize = chunk_size,
+                      offset: i64 = -1) -> Result[[]u8, Error]
     val p: &Pending[Result[[]u8, Error]] = pending()
 
-    libuv.read(f, chunk_size, (r) -> p.finish(r), -1, lp)?
+    libuv.read(f, length, (r) -> p.finish(r), offset, lp)?
 
     val r = await settled(p)
 
     Ok(r?)
 
-private async write_on(lp: &libuv.Loop, f: libuv.File, bytes: []const u8) -> Result[usize, Error]
+private async write_on(lp: &libuv.Loop, f: libuv.File, bytes: []const u8,
+                       offset: i64 = -1) -> Result[usize, Error]
     val p: &Pending[Result[usize, Error]] = pending()
 
-    libuv.write(f, bytes, (r) -> p.finish(r), -1, lp)?
+    libuv.write(f, bytes, (r) -> p.finish(r), offset, lp)?
 
     val r = await settled(p)
 
@@ -98,4 +101,120 @@ private async close_on(lp: &libuv.Loop, f: libuv.File) -> Result[unit, Error]
     Ok(r?)
 
 private ignore(r: Result[unit, Error]) -> unit = ()
+
+/** An open file, read and written a piece at a time on libuv's thread pool. Reached through `&File`;
+ * `close` ends it, and a file dropped without being closed is closed then.
+ */
+struct File
+    private lp: &libuv.Loop
+    private fd: libuv.File
+    private open: bool
+
+    /** A task that ends with up to `n` bytes from where the file is positioned, moving it on -- an
+     * empty slice at the end of the file.
+     */
+    read(&self, n: usize) -> Task[Result[[]u8, Error]] = read_part(self, n, -1)
+
+    /** The same at `offset`, leaving the position where it was. */
+    read_at(&self, n: usize, offset: i64) -> Task[Result[[]u8, Error]] = read_part(self, n, offset)
+
+    /** A task that ends when every one of `bytes` has been written where the file is positioned. */
+    write(&self, bytes: []const u8) -> Task[Result[unit, Error]] = write_part(self, bytes, -1)
+
+    /** The same at `offset`, leaving the position where it was. */
+    write_at(&self, bytes: []const u8, offset: i64) -> Task[Result[unit, Error]] =
+        write_part(self, bytes, offset)
+
+    /** A task that ends when the file is closed, with what closing it answered. Closing again ends
+     * at once with `Ok`, and a read or write started after it is `EBADF`.
+     */
+    close(&self) -> Task[Result[unit, Error]] = close_file(self)
+end File
+
+impl Drop for File
+    drop(self)
+        if self.open then libuv.close(self.fd, ignore, self.lp)
+
+private[uv] async open_file_on(lp: &libuv.Loop, path: string, flags: i32, mode: i32) -> Result[&File, Error]
+    val p: &Pending[Result[libuv.File, Error]] = pending()
+    defer p.abandon()
+
+    libuv.open(path, (r) -> opened(p, r, lp), flags, mode, lp)?
+
+    val r = await settled(p)
+
+    Ok(File(lp, r?, true))
+
+// Whether `f` may still be read and written: a closed descriptor may be someone else's by now.
+private still_open(f: &File) -> Result[unit, Error] =
+    if f.open then Ok(()) else Err(libuv.Error(libuv.EBADF))
+
+private async read_part(f: &File, n: usize, offset: i64) -> Result[[]u8, Error]
+    still_open(f)?
+    await read_on(f.lp, f.fd, n, offset)
+
+private async write_part(f: &File, bytes: []const u8, offset: i64) -> Result[unit, Error]
+    still_open(f)?
+
+    var done: usize = 0
+
+    while done < bytes.len
+        val at = if offset < 0 then offset else offset + i64(done)
+
+        done += (await write_on(f.lp, f.fd, bytes[done..], at))?
+
+    Ok(())
+
+private async close_file(f: &File) -> Result[unit, Error]
+    if !f.open then return Ok(())
+
+    f.open = false
+    await close_on(f.lp, f.fd)
+
+// -- The rest of the file system, one request each ----------------------------------------------
+
+private[uv] async stat_on(lp: &libuv.Loop, path: string) -> Result[libuv.Stat, Error]
+    val p: &Pending[Result[libuv.Stat, Error]] = pending()
+
+    libuv.stat(path, (r) -> p.finish(r), lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+private[uv] async scandir_on(lp: &libuv.Loop, path: string) -> Result[[]libuv.Dirent, Error]
+    val p: &Pending[Result[[]libuv.Dirent, Error]] = pending()
+
+    libuv.scandir(path, (r) -> p.finish(r), lp)?
+
+    val r = await settled(p)
+
+    Ok(r?)
+
+// The calls that answer nothing but whether they worked: each starts its request with the callback
+// it is handed, and this awaits it.
+private async done_on(start: &Fn(&Fn(Result[unit, Error]) -> unit) -> Result[unit, Error]) -> Result[unit, Error]
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    start((r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    Ok(())
+
+private[uv] mkdir_on(lp: &libuv.Loop, path: string, mode: i32) -> Task[Result[unit, Error]] =
+    done_on((cb) -> libuv.mkdir(path, cb, mode, lp))
+
+private[uv] rmdir_on(lp: &libuv.Loop, path: string) -> Task[Result[unit, Error]] =
+    done_on((cb) -> libuv.rmdir(path, cb, lp))
+
+private[uv] unlink_on(lp: &libuv.Loop, path: string) -> Task[Result[unit, Error]] =
+    done_on((cb) -> libuv.unlink(path, cb, lp))
+
+private[uv] rename_on(lp: &libuv.Loop, path: string, to: string) -> Task[Result[unit, Error]] =
+    done_on((cb) -> libuv.rename(path, to, cb, lp))
+
+private[uv] chmod_on(lp: &libuv.Loop, path: string, mode: i32) -> Task[Result[unit, Error]] =
+    done_on((cb) -> libuv.chmod(path, mode, cb, lp))
 #endif

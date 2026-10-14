@@ -1,0 +1,62 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Work too slow for the loop, and a wake from another thread.
+//
+//     val digest = (await io.work(() -> hash(p)))?       // on libuv's pool; the loop goes on meanwhile
+//
+//     val r = io.remote(3)?                             // handed to a thread of the program's own
+//     ... on that thread: r.raise()                     // source 3 is raised, and the loop wakes now
+//
+// **A job is a `&sync Fn() -> T`**, because it runs on a pool thread: what it captures is what any
+// closure crossing threads may capture -- scalars, arrays, `&sync T`, `*T` -- and the compiler says
+// so at the call. Its answer comes back through a `&sync` cell, so a `T` that cannot be held in one
+// is refused there too.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sh.sysl.kairos.signal
+
+// Where a job leaves its answer for the loop's thread to take.
+private struct Slot[T]
+    value: Option[T]
+
+private[uv] async work_on[T](lp: &libuv.Loop, job: &sync Fn() -> T) -> Result[T, Error]
+    val slot: &sync Slot[T] = Slot(None)
+    val p: &Pending[Result[unit, Error]] = pending()
+    val w = libuv.queue(() -> slot.value = Some(job()), (r) -> p.finish(r), lp)?
+
+    // A job no thread has taken yet is taken off the queue; one already running runs to its end, and
+    // its answer lands in a slot nothing reads.
+    defer if w.is_pending() then w.cancel().unwrap_or(())
+
+    val r = await settled(p)
+
+    r?
+    Ok(slot.value.expect("a job that reported has answered"))
+end work_on
+
+/** Raises a source of the loop from any thread, and wakes libuv so the loop sees it at once rather
+ * than at its next event. It is a value: copy it to as many threads as raise the source.
+ */
+struct Remote
+    private source: u32
+    private waker: libuv.Waker
+
+    /** Raise the source, as `signal(n)` does, and wake the loop. */
+    raise(self)
+        signal(self.source)
+        self.waker.send().unwrap_or(())
+end Remote
+
+private[uv] remote_of(n: u32, notify: &libuv.Async) -> Remote = Remote(n, notify.waker())
+
+// The one notifier a driver's remotes wake: it does nothing but end libuv's wait, and it keeps no loop
+// alive.
+private[uv] notifier_on(lp: &libuv.Loop) -> Result[&libuv.Async, Error]
+    val a = libuv.notifier(nothing, lp)?
+
+    a.unref()
+    Ok(a)
+#endif

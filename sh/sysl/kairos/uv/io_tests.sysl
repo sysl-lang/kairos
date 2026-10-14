@@ -1,0 +1,573 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// Pipes, child processes, signals, the file system, the thread pool and a wake from another thread,
+// each checked against something other than kairos itself: the kernel's descriptors, libuv's own
+// blocking calls, the child's exit status, a thread id.
+
+import sh.sysl.libuv
+import sh.sysl.kairos.{Loop, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.millis
+
+private struct Heard
+    n: int
+
+private heard() -> &Heard = Heard(0)
+
+private as_text(bytes: []const u8) -> string = from_utf8_lossy(bytes)
+
+private place(name: string) -> string = s"/tmp/sysl-kairos-io-test-$name"
+
+private parked_then_dropped[T](t: Task[T], h: &Heard)
+    assert(!step(t, () -> h.n += 1), "the task parked")
+
+// The descriptor the kernel would hand out next, which rises with every one left open. `dup` and
+// `close_fd` are `tests.sysl`'s.
+private lowest_free() -> i32
+    val fd = dup(2)
+
+    assert(fd >= 0, "a descriptor to probe with")
+    close_fd(fd)
+    fd
+
+// Everything a stream has to say until its end.
+private async drain(p: &Pipe) -> []u8
+    var out: Buf[u8] = buf()
+
+    loop
+        val got = (await p.read()).expect("read")
+
+        if got.len == 0 then break
+
+        out.extend(got)
+
+    out.view()
+
+// -- Pipes --------------------------------------------------------------------------------------
+
+@test("a socket pair carries bytes both ways")
+socket_pair_echo()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+
+    lp.block_on(a.write("ping".bytes)).expect("ran").expect("written")
+    assert_eq(as_text(lp.block_on(b.read()).expect("ran").expect("read")), "ping")
+
+    lp.block_on(b.write("pong".bytes)).expect("ran").expect("written")
+    assert_eq(as_text(lp.block_on(a.read()).expect("ran").expect("read")), "pong")
+    assert(!a.is_terminal(), "a socket is not a terminal")
+
+    a.close()
+    b.close()
+    lp.run()
+    assert(!io.on_loop().alive(), "both closed")
+
+@test("after a shutdown the other end reads the end of the stream, and can still answer")
+socket_pair_half_close()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+
+    lp.block_on(a.write("last".bytes)).expect("ran").expect("written")
+    lp.block_on(a.shutdown()).expect("ran").expect("half-closed")
+
+    assert_eq(as_text(lp.block_on(drain(b)).expect("ran")), "last")
+
+    lp.block_on(b.write("still here".bytes)).expect("ran").expect("written")
+    assert_eq(as_text(lp.block_on(a.read()).expect("ran").expect("read")), "still here")
+
+    a.close()
+    b.close()
+    lp.run()
+
+@test("an adopted descriptor is a stream, and closing it closes the descriptor")
+adopting_a_descriptor()
+    val io = uv()
+    val lp = event_loop(io)
+    val before = lowest_free()
+    val (r, w) = libuv.pipe_pair().expect("a pipe(2)")
+    val reading = io.adopt(r).expect("adopted")
+    val writing = io.adopt(w).expect("adopted")
+
+    lp.block_on(writing.write("through".bytes)).expect("ran").expect("written")
+    writing.close()
+
+    assert_eq(as_text(lp.block_on(drain(reading)).expect("ran")), "through")
+
+    reading.close()
+    lp.run()
+    assert_eq(lowest_free(), before)
+
+@test("a read waiting on a pipe that is closed ends with ECANCELED")
+read_on_closed_pipe()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+    val t = a.read()
+    val h = heard()
+
+    assert(!step(t, () -> h.n += 1), "the read parked")
+    a.close()
+    assert_eq(h.n, 1)
+
+    lp.block_on(t).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ECANCELED)
+        Ok(_) -> assert(false, "a read on a closed pipe answered")
+
+    b.close()
+    lp.run()
+
+// -- Processes ----------------------------------------------------------------------------------
+
+@test("a child's piped output is read to its end, and it exits with status 0")
+echo_through_a_pipe()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/echo", ["hello", "there"], stdout = Piped).expect("spawned")
+
+    assert(p.stdin().is_none() && p.stderr().is_none(), "only stdout was piped")
+    assert_eq(as_text(lp.block_on(drain(p.stdout().expect("piped"))).expect("ran")), "hello there\n")
+
+    val e = lp.block_on(p.exit()).expect("ran")
+
+    assert_eq(e.status, 0)
+    assert_eq(e.signal, 0)
+    lp.run()
+    assert(!io.on_loop().alive(), "the child's handle and its pipe were closed")
+
+private async round_trip(p: &Process, bytes: []const u8) -> []u8
+    val input = p.stdin().expect("piped")
+
+    (await input.write(bytes)).expect("written")
+    input.close()
+
+    await drain(p.stdout().expect("piped"))
+
+@test("cat hands back every byte written to it, through two pipes")
+cat_round_trip()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/cat", [], stdin = Piped, stdout = Piped).expect("spawned")
+    var sent: []u8 = [0; 100000]
+
+    for i in 0..<sent.len do sent[i] = u8(i % 251)
+
+    val back = lp.block_on(round_trip(p, sent)).expect("ran")
+
+    assert_eq(back.len, sent.len)
+    assert(back == sent, "the same bytes, in order")
+    assert_eq(lp.block_on(p.exit()).expect("ran").status, 0)
+    lp.run()
+
+@test("an exit status is the child's own")
+exit_status()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "exit 3"]).expect("spawned")
+    val e = lp.block_on(p.exit()).expect("ran")
+
+    assert_eq(e.status, 3)
+    assert_eq(e.signal, 0)
+    assert(p.pid() > 0, "it had a process id")
+
+    // Already exited: the answer is at once, and a signal to it is refused rather than sent.
+    assert_eq(lp.block_on(p.exit()).expect("ran").status, 3)
+    assert(p.kill(libuv.SIGTERM).is_err(), "a child that has exited is not signalled")
+    lp.run()
+
+@test("a child killed with SIGTERM reports the signal that ended it")
+kill_reports_the_signal()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sleep", ["10"]).expect("spawned")
+
+    p.kill(libuv.SIGTERM).expect("signalled")
+
+    val e = lp.block_on(lp.timeout(millis(5000), p.exit())).expect("ran").expect("it exited in time")
+
+    assert_eq(e.signal, libuv.SIGTERM)
+    assert_eq(e.status, 0)
+    lp.run()
+
+@test("a program that is not there is ENOENT, from spawn itself")
+spawn_missing()
+    val io = uv()
+    val lp = event_loop(io)
+
+    // libuv keeps one descriptor of its own from the first spawn with a pipe, failed or not, so the
+    // count is taken after one; what is measured is that more leave it where it was.
+    assert(io.spawn("/no/such/program", [], stdout = Piped).is_err(), "nothing to start")
+    lp.run()
+
+    val before = lowest_free()
+
+    for i in 0..<10
+        io.spawn("/no/such/program", [], stdin = Piped, stdout = Piped) match
+            Err(e) -> assert_eq(e.code, libuv.ENOENT)
+            Ok(_) -> assert(false, "a missing program was started")
+
+    lp.run()
+    assert(!io.on_loop().alive(), "the failed spawns left nothing on the loop")
+    assert_eq(lowest_free(), before)
+
+// Each child is dropped at once, with its output piped and never read.
+private spawn_and_drop(io: &Uv, rounds: int)
+    for i in 0..<rounds do io.spawn("/bin/echo", ["x"], stdout = Piped).expect("spawned")
+
+@test("children dropped unwaited are reaped and closed: over many, no handle and no descriptor is left")
+dropped_children_leave_nothing()
+    val io = uv()
+    val lp = event_loop(io)
+
+    spawn_and_drop(io, 1)
+    lp.run()
+
+    val before = lowest_free()
+
+    spawn_and_drop(io, 50)
+
+    // A dropped child still running keeps the loop alive, so `run` returns once all have exited.
+    lp.run()
+
+    assert(!io.on_loop().alive(), "every child's handle was closed")
+    assert_eq(lowest_free(), before)
+
+// -- Signals ------------------------------------------------------------------------------------
+
+private async raise_later(lp: &Loop[Uv], signum: i32)
+    await lp.sleep(millis(10))
+    libuv.kill(libuv.pid(), signum).expect("sent")
+
+@test("a signal raised to this process ends the task awaiting it")
+await_a_signal()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.spawn(raise_later(lp, libuv.SIGUSR1))
+
+    val got = lp.block_on(lp.timeout(millis(5000), io.signal(libuv.SIGUSR1))).expect("ran")
+
+    assert_eq(got.expect("it arrived in time").expect("watched"), libuv.SIGUSR1)
+    lp.run()
+    assert(!io.on_loop().alive(), "the watcher was closed")
+
+@test("a watcher counts arrivals nobody waited for, and keeps the loop alive only while awaited")
+signals_are_counted()
+    val io = uv()
+    val lp = event_loop(io)
+    val s = io.signals(libuv.SIGUSR2).expect("watching")
+
+    assert(!io.on_loop().alive(), "a watcher nobody awaits keeps nothing running")
+
+    libuv.kill(libuv.pid(), libuv.SIGUSR2).expect("sent")
+    lp.block_on(lp.sleep(millis(20))).expect("slept")
+    libuv.kill(libuv.pid(), libuv.SIGUSR2).expect("sent")
+    lp.block_on(lp.sleep(millis(20))).expect("slept")
+
+    assert_eq(lp.block_on(s.next()).expect("ran").expect("first"), libuv.SIGUSR2)
+    assert_eq(lp.block_on(s.next()).expect("ran").expect("second"), libuv.SIGUSR2)
+    assert_eq(s.number(), libuv.SIGUSR2)
+
+    val t = s.next()
+    val h = heard()
+
+    assert(!step(t, () -> h.n += 1), "nothing left, so it waits")
+    s.close()
+    assert_eq(h.n, 1)
+
+    lp.block_on(t).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ECANCELED)
+        Ok(_) -> assert(false, "a closed watcher answered")
+
+    lp.run()
+
+// -- The file system ----------------------------------------------------------------------------
+
+@test("mkdir, stat, chmod, scandir, rename, unlink and rmdir, each checked with libuv's blocking calls")
+file_system_round_trip()
+    val io = uv()
+    val lp = event_loop(io)
+    val dir = place("tree")
+
+    lp.block_on(io.mkdir(dir)).expect("ran").expect("made")
+    assert(libuv.stat_sync(dir).expect("there").is_dir(), "a directory")
+
+    for name in ["c", "a", "b"]
+        libuv.write_file_sync(dir + "/" + name, "12345".bytes).expect("written")
+
+    val st = lp.block_on(io.stat(dir + "/a")).expect("ran").expect("stat")
+
+    assert_eq(st.size, 5)
+    assert(st.is_file(), "a file")
+
+    lp.block_on(io.chmod(dir + "/a", 416)).expect("ran").expect("changed")
+    assert_eq(libuv.stat_sync(dir + "/a").expect("stat").mode & 511, 416)
+
+    val listed = lp.block_on(io.scandir(dir)).expect("ran").expect("listed")
+    var names: Buf[string] = buf()
+
+    for d in listed do names.push(d.name)
+
+    assert_eq(names.view(), ["a", "b", "c"])
+
+    lp.block_on(io.rename(dir + "/a", dir + "/z")).expect("ran").expect("renamed")
+    assert(libuv.stat_sync(dir + "/a").is_err(), "the old name is gone")
+    assert_eq(libuv.stat_sync(dir + "/z").expect("the new one is there").size, 5)
+
+    for name in ["b", "c", "z"]
+        lp.block_on(io.unlink(dir + "/" + name)).expect("ran").expect("removed")
+
+    lp.block_on(io.rmdir(dir)).expect("ran").expect("removed")
+    assert(libuv.stat_sync(dir).is_err(), "the directory is gone")
+end file_system_round_trip
+
+private failed_with(r: Result[unit, Error], code: i32)
+    r match
+        Err(e) -> assert_eq(e.name(), libuv.Error(code).name())
+        Ok(_) -> assert(false, "it succeeded")
+
+@test("the file system's refusals are libuv's own: ENOENT, EEXIST, ENOTEMPTY")
+file_system_refusals()
+    val io = uv()
+    val lp = event_loop(io)
+    val dir = place("refusals")
+
+    lp.block_on(io.stat("/no/such/path")).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ENOENT)
+        Ok(_) -> assert(false, "stat of nothing answered")
+
+    lp.block_on(io.scandir("/no/such/path")).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ENOENT)
+        Ok(_) -> assert(false, "scandir of nothing answered")
+
+    libuv.mkdir_sync(dir).expect("made")
+    libuv.write_file_sync(dir + "/f", [1]).expect("written")
+
+    failed_with(lp.block_on(io.mkdir(dir)).expect("ran"), libuv.EEXIST)
+    failed_with(lp.block_on(io.rmdir(dir)).expect("ran"), libuv.ENOTEMPTY)
+    failed_with(lp.block_on(io.unlink(dir + "/nothing")).expect("ran"), libuv.ENOENT)
+    failed_with(lp.block_on(io.rename(dir + "/nothing", dir + "/g")).expect("ran"), libuv.ENOENT)
+    failed_with(lp.block_on(io.chmod(dir + "/nothing", 420)).expect("ran"), libuv.ENOENT)
+
+    libuv.unlink_sync(dir + "/f").expect("removed")
+    libuv.rmdir_sync(dir).expect("removed")
+end file_system_refusals
+
+private async stream_out(io: &Uv, path: string) -> []u8
+    val f = (await io.open(path)).expect("opened")
+    var out: Buf[u8] = buf()
+
+    loop
+        val got = (await f.read(65536)).expect("read")
+
+        if got.len == 0 then break
+
+        out.extend(got)
+
+    (await f.close()).expect("closed")
+    out.view()
+
+@test("an 8 MB file streamed a piece at a time is the file read whole")
+streamed_file()
+    val io = uv()
+    val lp = event_loop(io)
+    val path = place("streamed")
+    var bytes: []u8 = [0; 8388608]
+
+    for i in 0..<bytes.len do bytes[i] = u8((i * 7 + i / 4096) % 256)
+
+    lp.block_on(io.write_file(path, bytes)).expect("ran").expect("written")
+
+    val streamed = lp.block_on(stream_out(io, path)).expect("ran")
+    val whole = lp.block_on(io.read_file(path)).expect("ran").expect("read")
+
+    assert_eq(streamed.len, 8388608)
+    assert(streamed == whole, "streamed and whole agree")
+    assert(streamed == bytes, "and both are what was written")
+
+    libuv.unlink_sync(path).expect("removed")
+
+private async positioned(io: &Uv, path: string) -> string
+    val flags = libuv.O_RDWR | libuv.O_CREAT | libuv.O_TRUNC
+    val f = (await io.open(path, flags, 420)).expect("opened")
+
+    (await f.write("hello world".bytes)).expect("written")
+    (await f.write_at("W".bytes, 6)).expect("written at")
+
+    val middle = (await f.read_at(5, 6)).expect("read at")
+
+    (await f.close()).expect("closed")
+    (await f.close()).expect("closing again is nothing")
+
+    (await f.read(1)) match
+        Err(e) -> assert_eq(e.code, libuv.EBADF)
+        Ok(_) -> assert(false, "a closed file was read")
+
+    as_text(middle)
+end positioned
+
+@test("positioned writes and reads land where they were asked to, and a closed file is EBADF")
+positioned_file()
+    val io = uv()
+    val lp = event_loop(io)
+    val path = place("positioned")
+
+    assert_eq(lp.block_on(positioned(io, path)).expect("ran"), "World")
+    assert_eq(as_text(libuv.read_file_sync(path).expect("read")), "hello World")
+
+    libuv.unlink_sync(path).expect("removed")
+
+@test("opening a file that is not there is ENOENT")
+open_missing()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(io.open("/no/such/file")).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ENOENT)
+        Ok(_) -> assert(false, "opened nothing")
+
+@test("files dropped unclosed are closed: no descriptor is left")
+dropped_files_close()
+    val io = uv()
+    val lp = event_loop(io)
+    val path = place("dropped")
+
+    libuv.write_file_sync(path, [1, 2, 3]).expect("written")
+    lp.block_on(io.open(path)).expect("ran").expect("opened")
+    lp.run()
+
+    val before = lowest_free()
+
+    for i in 0..<20 do lp.block_on(io.open(path)).expect("ran").expect("opened")
+
+    lp.run()
+    assert_eq(lowest_free(), before)
+    libuv.unlink_sync(path).expect("removed")
+
+// -- The thread pool ----------------------------------------------------------------------------
+
+private square(n: long) -> long = n * n
+
+@test("work runs on a pool thread and ends with its answer")
+work_answers()
+    val io = uv()
+    val lp = event_loop(io)
+    val here = libuv.current_thread()
+    val there = lp.block_on(io.work(() -> libuv.current_thread())).expect("ran").expect("worked")
+
+    assert(there != here, "the job ran on a thread other than the loop's")
+    assert_eq(lp.block_on(io.work(() -> square(12))).expect("ran").expect("worked"), 144)
+
+private async many_squares(io: &Uv, n: int) -> long
+    var tasks: Buf[Task[Result[long, Error]]] = buf()
+
+    for i in 0..<n
+        val k = long(i)
+
+        tasks.push(io.work(() -> square(k)))
+
+    var sum: long = 0
+
+    for t in tasks.view() do sum += (await t).expect("worked")
+
+    sum
+
+@test("many jobs in flight at once each answer")
+many_jobs()
+    val io = uv()
+    val lp = event_loop(io)
+
+    // 0² + 1² + … + 63² = 63 · 64 · 127 / 6
+    assert_eq(lp.block_on(many_squares(io, 64)).expect("ran"), 85344)
+
+// -- A wake from another thread -----------------------------------------------------------------
+
+@test("a remote raised from another thread wakes a loop libuv is holding in a wait")
+remote_wakes_the_loop()
+    val io = uv()
+    val lp = event_loop(io)
+    val r = io.remote(5).expect("a remote")
+    val start = io.now()
+    val t = libuv.thread(() ->
+        libuv.sleep(50)
+        r.raise()).expect("a thread")
+
+    // The timeout gives libuv a five-second wait: only the remote's wake ends it sooner.
+    val got = lp.block_on(lp.timeout(millis(5000), lp.wait_for(5))).expect("ran")
+
+    t.join().expect("joined")
+    assert(got.is_some(), "the source was raised")
+    assert(io.now() - start < millis(1000), "and noticed at once, not at the deadline")
+    assert(!io.on_loop().alive(), "the notifier keeps nothing running")
+
+// -- Cancel by drop -----------------------------------------------------------------------------
+
+@test("a dropped read on a pipe consumes nothing, and its waker never fires")
+dropped_pipe_read()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+    val h = heard()
+
+    parked_then_dropped(b.read(), h)
+    lp.block_on(a.write("kept".bytes)).expect("ran").expect("written")
+    lp.block_on(lp.sleep(millis(20))).expect("slept")
+
+    assert_eq(h.n, 0)
+    assert_eq(as_text(lp.block_on(b.read()).expect("ran").expect("read")), "kept")
+
+    a.close()
+    b.close()
+    lp.run()
+    assert(!io.on_loop().alive(), "nothing left")
+
+@test("a dropped exit wait leaves the child to finish, and nothing behind once it has")
+dropped_exit_wait()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/echo", ["x"], stdout = Ignore).expect("spawned")
+    val h = heard()
+
+    parked_then_dropped(p.exit(), h)
+    lp.run()
+
+    assert_eq(h.n, 0)
+    assert(!io.on_loop().alive(), "the child's handle was closed")
+
+@test("a dropped file-system request is answered into nothing, and leaves nothing")
+dropped_fs_request()
+    val io = uv()
+    val lp = event_loop(io)
+    val h = heard()
+    val path = place("dropped-open")
+
+    libuv.write_file_sync(path, [1]).expect("written")
+
+    val before = lowest_free()
+
+    parked_then_dropped(io.stat("/tmp"), h)
+    parked_then_dropped(io.open(path), h)
+    lp.run()
+
+    assert_eq(h.n, 0)
+    assert(!io.on_loop().alive(), "both requests finished")
+    assert_eq(lowest_free(), before)
+    libuv.unlink_sync(path).expect("removed")
+
+@test("a dropped job is taken off the queue or runs to its end, and leaves nothing")
+dropped_work()
+    val io = uv()
+    val lp = event_loop(io)
+    val h = heard()
+
+    parked_then_dropped(io.work(() -> square(3)), h)
+    lp.run()
+
+    assert_eq(h.n, 0)
+    assert(!io.on_loop().alive(), "the job was finished with")
+#endif

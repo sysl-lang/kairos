@@ -1,0 +1,115 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Signals, delivered to tasks on the loop rather than to a handler.
+//
+//     val n = (await io.signal(libuv.SIGINT))?           // the next Ctrl-C
+//
+//     val hups = io.signals(libuv.SIGHUP)?               // every one, for as long as it is held
+//     loop
+//         (await hups.next())?
+//         reload()
+//
+// **A watcher keeps the loop running only while a task waits on it**, which is node's rule: a
+// program whose one remaining thing is a handler for `SIGINT` ends, and one awaiting `SIGINT` waits.
+// A signal that arrives while nobody is waiting is counted, and the next `next` takes it.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+
+/** A watcher for one signal. Reached through `&Signals`; `close` stops it, and a watcher dropped
+ * without being closed is closed then.
+ */
+struct Signals
+    private watcher: &libuv.Signal
+    private signum: i32
+    private arrived: usize
+    private closed: bool
+    private waiter: Option[&Pending[unit]]
+
+    /** A task that ends with the signal's number at its next arrival -- or at once, for one that
+     * arrived while nobody waited. Dropping it leaves that arrival for the next `next`.
+     */
+    next(&self) -> Task[Result[i32, Error]] = next_of(self)
+
+    /** The signal watched. */
+    number(self) -> i32 = self.signum
+
+    /** Stop watching, and put back what the signal did before. A task waiting in `next` ends with
+     * `ECANCELED`. Closing again does nothing.
+     */
+    close(*self)
+        close_handle(self.watcher)
+
+        self.closed = true
+
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+
+    // libuv's callback: one more arrival, and a task may be waiting for it.
+    private raised(*self)
+        self.arrived += 1
+
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+end Signals
+
+impl Drop for Signals
+    drop(self) = close_handle(self.watcher)
+
+private[uv] signals_on(lp: &libuv.Loop, signum: i32) -> Result[&Signals, Error]
+    val w = libuv.signal(lp)?
+    var s: &Signals = Signals(w, signum, 0, false, None)
+
+    // Weak, as a listener's callback is: the handle would otherwise hold the watcher for ever.
+    val held: weak Signals = s
+
+    w.start(signum, (n) -> held.get() match
+        Some(it) -> it.raised()
+        None -> ()) match
+        Err(e) ->
+            w.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    w.unref()
+    Ok(s)
+end signals_on
+
+private async next_of(s: &Signals) -> Result[i32, Error]
+    if s.arrived == 0 && !s.closed
+        val p: &Pending[unit] = pending()
+        val w = s.watcher
+
+        // Counted by the loop only while it is awaited.
+        w.keep()
+        s.waiter = Some(p)
+        defer waited(s)
+        await settled(p)
+
+    if s.closed then return Err(cancelled())
+
+    s.arrived -= 1
+    Ok(s.number())
+end next_of
+
+private waited(s: &Signals)
+    val w = s.watcher
+
+    s.waiter = None
+    if !w.is_closing() then w.unref()
+
+/** The next arrival of `signum`, on a watcher of its own that is closed as the task ends. */
+private[uv] async signal_on(lp: &libuv.Loop, signum: i32) -> Result[i32, Error]
+    val s = signals_on(lp, signum)?
+
+    defer s.close()
+    await s.next()
+#endif

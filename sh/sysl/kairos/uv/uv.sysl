@@ -40,6 +40,7 @@ struct Uv
     private lp: &libuv.Loop
     private timer: &libuv.Timer
     private origin: Duration
+    private notify: Option[&libuv.Async]
 
     /** The libuv loop every handle and request this driver's operations make is on. */
     on_loop(self) -> &libuv.Loop = self.lp
@@ -66,6 +67,84 @@ struct Uv
      */
     resolve(self, host: string, service: string = "", flags: i32 = 0) -> Task[Result[[]libuv.AddrInfo, Error]] =
         resolve_on(self.lp, host, service, flags)
+
+    /** Two connected streams, which is `socketpair(2)`: what is written to one is read from the
+     * other.
+     */
+    socket_pair(self) -> Result[(&Pipe, &Pipe), Error] = socket_pair_on(self.lp)
+
+    /** This process's standard input as a stream: a terminal if it is one, a pipe or a socket
+     * otherwise. libuv owns the descriptor afterwards, and closing the stream closes it.
+     */
+    stdin(self) -> Result[&Pipe, Error] = adopt_on(self.lp, 0)
+
+    /** Standard output, as `stdin` is opened. */
+    stdout(self) -> Result[&Pipe, Error] = adopt_on(self.lp, 1)
+
+    /** Standard error, as `stdin` is opened. */
+    stderr(self) -> Result[&Pipe, Error] = adopt_on(self.lp, 2)
+
+    /** A stream over a descriptor this process already has -- a pipe, a socket, a terminal. libuv
+     * owns it afterwards.
+     */
+    adopt(self, fd: i32) -> Result[&Pipe, Error] = adopt_on(self.lp, fd)
+
+    /** Start `file` -- looked up on `PATH` unless it holds a slash -- with `args`, which do not
+     * include its own name. `env` of `[]` inherits this process's environment, and anything else
+     * replaces it; `cwd` of `""` starts it here. A program that is not there is `ENOENT`, from this
+     * call.
+     */
+    spawn(self, file: string, args: []const string, env: []const string = [], cwd: string = "",
+          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit) -> Result[&Process, Error] =
+        spawn_on(self.lp, file, args, env, cwd, stdin, stdout, stderr)
+
+    /** A task that ends with `signum` at its next arrival, on a watcher of its own. */
+    signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum)
+
+    /** A watcher for every arrival of `signum`, taken one at a time with `next`. */
+    signals(self, signum: i32) -> Result[&Signals, Error] = signals_on(self.lp, signum)
+
+    /** A task that ends with what the file system knows about `path`, following links. */
+    stat(self, path: string) -> Task[Result[libuv.Stat, Error]] = stat_on(self.lp, path)
+
+    /** A task that ends with everything in the directory `path`, without `.` and `..`, in name order. */
+    scandir(self, path: string) -> Task[Result[[]libuv.Dirent, Error]] = scandir_on(self.lp, path)
+
+    /** A task that makes the directory `path`, and only its last component. */
+    mkdir(self, path: string, mode: i32 = 511) -> Task[Result[unit, Error]] = mkdir_on(self.lp, path, mode)
+
+    /** A task that removes the empty directory `path`; `ENOTEMPTY` if it is not empty. */
+    rmdir(self, path: string) -> Task[Result[unit, Error]] = rmdir_on(self.lp, path)
+
+    /** A task that removes the file `path`. */
+    unlink(self, path: string) -> Task[Result[unit, Error]] = unlink_on(self.lp, path)
+
+    /** A task that renames or moves `path` to `to`. */
+    rename(self, path: string, to: string) -> Task[Result[unit, Error]] = rename_on(self.lp, path, to)
+
+    /** A task that sets the permission bits of `path` to `mode`. */
+    chmod(self, path: string, mode: i32) -> Task[Result[unit, Error]] = chmod_on(self.lp, path, mode)
+
+    /** A task that opens `path` as a `File`, with libuv's `O_` flags and, for a file it creates,
+     * `mode`.
+     */
+    open(self, path: string, flags: i32 = libuv.O_RDONLY, mode: i32 = 420) -> Task[Result[&File, Error]] =
+        open_file_on(self.lp, path, flags, mode)
+
+    /** A task that runs `job` on libuv's thread pool and ends with what it answered. Dropping the
+     * task takes a job no thread has started off the queue.
+     */
+    work[T](self, job: &sync Fn() -> T) -> Task[Result[T, Error]] = work_on(self.lp, job)
+
+    /** A handle another thread raises source `n` through, waking the loop at once. */
+    remote(*self, n: u32) -> Result[Remote, Error]
+        self.notify match
+            Some(a) -> Ok(remote_of(n, a))
+            None ->
+                val a = notifier_on(self.lp)?
+
+                self.notify = Some(a)
+                Ok(remote_of(n, a))
 end Uv
 
 /** A driver over libuv's default loop, which is what a program with one loop wants. */
@@ -74,7 +153,7 @@ uv() -> &Uv = uv_on(libuv.default_loop())
 /** A driver over `lp`, a libuv loop of the program's own. */
 uv_on(lp: &libuv.Loop) -> &Uv =
     // uv_timer_init only records the handle on the loop; it has no failure to answer.
-    Uv(lp, libuv.timer(lp).expect("a timer on an initialised loop"), monotonic())
+    Uv(lp, libuv.timer(lp).expect("a timer on an initialised loop"), monotonic(), None)
 
 private const slice_ms: long = 1
 
@@ -111,7 +190,7 @@ impl Driver for Uv
         self.lp.run(libuv.RUN_NOWAIT).expect("libuv ran")
 end Uv
 
-private nothing() = ()
+private[uv] nothing() = ()
 
 /** One operation's answer, and the waker of the task waiting for it.
  *

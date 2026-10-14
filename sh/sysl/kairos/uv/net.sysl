@@ -16,28 +16,29 @@ module sh.sysl.kairos.uv
 
 import sh.sysl.libuv
 import sh.sysl.libuv.{Handle, Stream}
-import sysl.slices.copy
 
-/** A connected TCP socket. Reached through `&Connection`; `close` ends it. */
+/** A connected TCP socket. Reached through `&Connection`; `close` ends it. Its reading and writing
+ * are `stream.sysl`'s, shared with `Pipe`.
+ */
 struct Connection
     private[uv] sock: &libuv.Tcp
-    private reading: Option[&Pending[Result[[]u8, Error]]]
+    private reads: &Reader
 
     /** A task that ends with the next bytes the peer sent -- at most 64 KiB -- or with an empty
      * slice once the peer has closed its half. Dropping it before it ends consumes nothing.
      */
-    read(&self) -> Task[Result[[]u8, Error]] = read_from(self)
+    read(self) -> Task[Result[[]u8, Error]] = read_stream(self.sock, self.reads)
 
     /** A task that ends when `bytes` have been handed to the kernel. The bytes are copied at the
      * start, so the caller's slice need not outlive it.
      */
-    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = write_to(self.sock, bytes)
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = write_stream(self.sock, bytes)
 
     /** A task that ends when this side's half of the stream is closed: every write queued before it
      * has gone, and the peer reads the end of the stream. Reading goes on -- the peer may still
      * answer, and `read` hands that over until the peer closes its own half.
      */
-    shutdown(self) -> Task[Result[unit, Error]] = shutdown_of(self.sock)
+    shutdown(self) -> Task[Result[unit, Error]] = shutdown_stream(self.sock)
 
     /** Turn Nagle's algorithm off (`true`) or back on: with it off, a small write is sent at once
      * rather than held back to be joined with the next.
@@ -56,20 +57,13 @@ struct Connection
     /** Close the socket. A task still reading from it ends with `ECANCELED`. Closing again does
      * nothing, and a connection dropped without being closed is closed then.
      */
-    close(*self)
-        close_tcp(self.sock)
-
-        self.reading match
-            Some(p) ->
-                self.reading = None
-                p.finish(Err(cancelled()))
-            None -> ()
+    close(self) = close_stream(self.sock, self.reads)
 end Connection
 
-// A connection nobody holds any more is one nobody can close, so its going is the close. Nothing can
-// be reading from it: a read in flight holds the connection.
+// A connection nobody holds any more is one nobody can close, so its going is the close -- and a read
+// still in flight on it ends with `ECANCELED`.
 impl Drop for Connection
-    drop(self) = close_tcp(self.sock)
+    drop(self) = close_stream(self.sock, self.reads)
 
 // Every socket here closes through this, so closing twice -- or closing and then dropping -- is safe.
 private close_tcp(s: &libuv.Tcp)
@@ -136,7 +130,7 @@ private[uv] async connect_on(lp: &libuv.Loop, addr: libuv.Address) -> Result[&Co
 
     r?
     connected = true
-    Ok(Connection(s, None))
+    Ok(Connection(s, reader()))
 
 private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int) -> Result[&Listener, Error]
     val s = libuv.tcp(lp)?
@@ -178,63 +172,6 @@ private async accept_from(l: &Listener) -> Result[&Connection, Error]
 
     val s = l.sock
 
-    Ok(Connection(s.accept()?, None))
+    Ok(Connection(s.accept()?, reader()))
 end accept_from
-
-private async read_from(c: &Connection) -> Result[[]u8, Error]
-    val s = c.sock
-
-    if s.is_closing() then return Err(cancelled())
-
-    val p: &Pending[Result[[]u8, Error]] = pending()
-
-    s.read_start((r) ->
-        s.read_stop()
-        p.finish(r match
-            libuv.Data(bytes) -> Ok(copy_of(bytes))
-            libuv.End -> Ok([0; 0])
-            libuv.Failed(e) -> Err(e)))?
-
-    c.reading = Some(p)
-    defer stop_reading(c)
-
-    await settled(p)
-end read_from
-
-private stop_reading(c: &Connection)
-    val s = c.sock
-
-    c.reading = None
-    if !s.is_closing() then s.read_stop()
-
-// What a task waiting on a socket that was closed under it ends with.
-private cancelled() -> Error = libuv.Error(libuv.ECANCELED)
-
-private async write_to(s: &libuv.Tcp, bytes: []const u8) -> Result[unit, Error]
-    val p: &Pending[Result[unit, Error]] = pending()
-
-    s.write(bytes, (r) -> p.finish(r))?
-
-    val r = await settled(p)
-
-    r?
-    Ok(())
-
-private async shutdown_of(s: &libuv.Tcp) -> Result[unit, Error]
-    val p: &Pending[Result[unit, Error]] = pending()
-
-    s.shutdown((r) -> p.finish(r))?
-
-    val r = await settled(p)
-
-    r?
-    Ok(())
-
-// libuv reads every chunk into the one buffer it reuses, so a chunk a task keeps is a copy -- made
-// with one `memmove` rather than byte by byte.
-private copy_of(bytes: []const u8) -> []u8
-    var out: []u8 = [0; bytes.len]
-
-    copy(out, bytes)
-    out
 #endif

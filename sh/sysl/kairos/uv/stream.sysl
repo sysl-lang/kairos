@@ -1,0 +1,174 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Byte streams: what a TCP connection, a pipe and a terminal share.
+//
+//     val (a, b) = io.socket_pair()?
+//     (await a.write("ping".bytes))?
+//     val got = (await b.read())?             // empty at the end of the stream
+//
+// **One implementation, every kind of stream.** The read, the write, the half-close and the close
+// below are written once over libuv's `Stream` trait; `Connection` and `Pipe` are thin owners of a
+// libuv handle and the one read that may be in flight on it.
+//
+// **libuv pushes and a task pulls.** A stream is read by starting libuv's reading, taking the first
+// chunk that arrives, and stopping again inside the callback -- so nothing arrives that no `read`
+// asked for, and a `read` that is dropped leaves the bytes in the kernel for the next one.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{Handle, Stream}
+import sysl.slices.copy
+
+/** The read a stream has in flight, if any: where `close` finds the task to end with `ECANCELED`. */
+private[uv] struct Reader
+    reading: Option[&Pending[Result[[]u8, Error]]]
+
+private[uv] reader() -> &Reader = Reader(None)
+
+private[uv] async read_stream[S: Stream](s: &S, r: &Reader) -> Result[[]u8, Error]
+    if s.is_closing() then return Err(cancelled())
+
+    val p: &Pending[Result[[]u8, Error]] = pending()
+
+    s.read_start((got) ->
+        s.read_stop()
+        p.finish(got match
+            libuv.Data(bytes) -> Ok(copy_of(bytes))
+            libuv.End -> Ok([0; 0])
+            libuv.Failed(e) -> Err(e)), 65536)?
+
+    r.reading = Some(p)
+    defer stop_reading(s, r)
+
+    await settled(p)
+end read_stream
+
+private stop_reading[S: Stream](s: &S, r: &Reader)
+    r.reading = None
+    if !s.is_closing() then s.read_stop()
+
+private[uv] async write_stream[S: Stream](s: &S, bytes: []const u8) -> Result[unit, Error]
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    s.write(bytes, (r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    Ok(())
+
+private[uv] async shutdown_stream[S: Stream](s: &S) -> Result[unit, Error]
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    s.shutdown((r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    Ok(())
+
+// Every stream here closes through this, so closing twice -- or closing and then dropping -- is safe,
+// and a task still reading ends with `ECANCELED` rather than waiting on a handle that is gone.
+private[uv] close_stream[S: Stream](s: &S, r: &Reader)
+    if !s.is_closing() then s.close(nothing)
+
+    r.reading match
+        Some(p) ->
+            r.reading = None
+            p.finish(Err(cancelled()))
+        None -> ()
+
+// What a task waiting on a handle that was closed under it ends with.
+private[uv] cancelled() -> Error = libuv.Error(libuv.ECANCELED)
+
+// libuv reads every chunk into the one buffer it reuses, so a chunk a task keeps is a copy -- made
+// with one `memmove` rather than byte by byte.
+private copy_of(bytes: []const u8) -> []u8
+    var out: []u8 = [0; bytes.len]
+
+    copy(out, bytes)
+    out
+
+// What a `Pipe` is over: a pipe or a socket of the Unix domain, or a terminal.
+private enum End
+    Piped(p: &libuv.Pipe)
+    Terminal(t: &libuv.Tty)
+
+/** One end of a pipe, of a Unix-domain socket, or a terminal: a child's standard streams, one of a
+ * `socket_pair`, or this process's own `stdin`, `stdout` and `stderr`. Reached through `&Pipe`;
+ * `close` ends it, and a pipe dropped without being closed is closed then.
+ */
+struct Pipe
+    private end: End
+    private reads: &Reader
+
+    /** A task that ends with the next bytes that arrived -- at most 64 KiB -- or with an empty slice
+     * once the other end has closed. Dropping it before it ends consumes nothing.
+     */
+    read(self) -> Task[Result[[]u8, Error]] = self.end match
+        Piped(p) -> read_stream(p, self.reads)
+        Terminal(t) -> read_stream(t, self.reads)
+
+    /** A task that ends when `bytes` have been handed to the kernel. The bytes are copied at the
+     * start, so the caller's slice need not outlive it.
+     */
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = self.end match
+        Piped(p) -> write_stream(p, bytes)
+        Terminal(t) -> write_stream(t, bytes)
+
+    /** A task that ends when this end's writing half is closed, once every write queued before it has
+     * gone: the other end reads the end of the stream, and may still answer.
+     */
+    shutdown(self) -> Task[Result[unit, Error]] = self.end match
+        Piped(p) -> shutdown_stream(p)
+        Terminal(t) -> shutdown_stream(t)
+
+    /** Whether this is a terminal, which is how `stdin` was opened when it is one. */
+    is_terminal(self) -> bool = self.end match
+        Piped(_) -> false
+        Terminal(_) -> true
+
+    /** Close it, and the descriptor under it. A task still reading ends with `ECANCELED`. Closing
+     * again does nothing.
+     */
+    close(self) = self.end match
+        Piped(p) -> close_stream(p, self.reads)
+        Terminal(t) -> close_stream(t, self.reads)
+end Pipe
+
+impl Drop for Pipe
+    drop(self) = self.close()
+
+private[uv] piped(p: &libuv.Pipe) -> &Pipe = Pipe(Piped(p), reader())
+
+/** Two connected streams, which is `socketpair(2)`: what is written to one is read from the other. */
+private[uv] socket_pair_on(lp: &libuv.Loop) -> Result[(&Pipe, &Pipe), Error]
+    val (a, b) = libuv.socket_pair()?
+
+    // Both are adopted before either can fail, so a descriptor that could not be is closed with the
+    // other's stream rather than left open.
+    val first = adopt_on(lp, a)
+    val second = adopt_on(lp, b)
+
+    Ok((first?, second?))
+
+/** A stream over a descriptor this process already has. A terminal is opened as one, and anything
+ * else -- a pipe, a socket -- as a pipe. **libuv owns the descriptor afterwards**, and closing the
+ * stream closes it.
+ */
+private[uv] adopt_on(lp: &libuv.Loop, fd: i32) -> Result[&Pipe, Error]
+    if libuv.guess_handle(fd) == libuv.HANDLE_TTY
+        return Ok(Pipe(Terminal(libuv.tty(fd, lp)?), reader()))
+
+    val p = libuv.pipe(false, lp)?
+
+    p.open(fd) match
+        Err(e) ->
+            p.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    Ok(piped(p))
+end adopt_on
+#endif
