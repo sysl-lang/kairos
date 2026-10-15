@@ -1,0 +1,245 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// File watching, the environment a child is given, and appending to a file. Each is checked against
+// something other than kairos: libuv's blocking calls make the changes and read the files, and a
+// child shell reports the environment it was given.
+//
+// **The platform decides how changes are batched**, as `libuv`'s own watcher tests say, so the
+// watcher tests look for a name and a flag among what was reported rather than for an exact list.
+
+import sh.sysl.libuv
+import sh.sysl.kairos.{Loop, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.millis
+
+private const SETTLE: long = 150
+private const QUIET: long = 400
+
+private struct Seen
+    names: Buf[string]
+    bits: Buf[i32]
+    failures: int
+    ended: Option[int]
+
+private seen() -> &Seen = Seen(buf(), buf(), 0, None)
+
+private scratch_dir(name: string) -> string
+    val dir = s"/tmp/sysl-kairos-watch-test-$name"
+
+    libuv.mkdir_sync(dir) match
+        Ok(_) -> ()
+        Err(e) -> assert_eq(e.code, libuv.EEXIST)
+
+    dir
+
+private bits_for(s: &Seen, name: string) -> i32
+    var all: i32 = 0
+
+    for i in 0..<s.names.len()
+        if s.names.at(i) == name then all |= s.bits.at(i)
+
+    all
+
+// Everything the watcher reports until it ends, which is its closing.
+private async collect(w: &Watch, s: &Seen)
+    loop
+        (await w.next()) match
+            Ok(c) ->
+                s.names.push(c.filename.unwrap_or(""))
+                s.bits.push(c.events)
+            Err(e) ->
+                s.ended = Some(int(e.code))
+                break
+
+private async after_settling(lp: &Loop[Uv], w: &Watch, act: &Fn() -> unit)
+    await lp.sleep(millis(SETTLE))
+    act()
+    await lp.sleep(millis(QUIET))
+    w.close()
+
+private watch_during(dir: string, recursive: bool, act: &Fn() -> unit) -> &Seen
+    val io = uv()
+    val lp = event_loop(io)
+    val s = seen()
+    val w = io.watch(dir, recursive).expect("watching")
+
+    lp.spawn(collect(w, s))
+    lp.block_on(after_settling(lp, w, act)).expect("ran")
+    lp.run()
+    assert(!io.on_loop().alive(), "the watcher was closed and nothing is left")
+    s
+
+@test("creating a file in a watched directory is a rename naming it")
+watch_create()
+    val dir = scratch_dir("create")
+    val s = watch_during(dir, false, () -> libuv.write_file_sync(dir + "/fresh", [1, 2, 3]).expect("written"))
+
+    assert((bits_for(s, "fresh") & libuv.FS_RENAME) != 0, "a new name is reported as a rename")
+    assert_eq(s.ended, Some(libuv.ECANCELED))
+
+    libuv.unlink_sync(dir + "/fresh").expect("removed")
+    libuv.rmdir_sync(dir).expect("removed")
+
+@test("modifying a watched file is a change naming it")
+watch_modify()
+    val dir = scratch_dir("modify")
+
+    libuv.write_file_sync(dir + "/kept", [1]).expect("written")
+
+    val s = watch_during(dir + "/kept", false, () -> libuv.write_file_sync(dir + "/kept", [9, 9]).expect("rewritten"))
+
+    assert((bits_for(s, "kept") & libuv.FS_CHANGE) != 0, "new contents are a change")
+    assert_eq(s.ended, Some(libuv.ECANCELED))
+
+    libuv.unlink_sync(dir + "/kept").expect("removed")
+    libuv.rmdir_sync(dir).expect("removed")
+
+@test("renaming a file in a watched directory reports the old name and the new one")
+watch_rename()
+    val dir = scratch_dir("rename")
+
+    libuv.write_file_sync(dir + "/before", [1]).expect("written")
+
+    val s = watch_during(dir, false, () -> libuv.rename_sync(dir + "/before", dir + "/after").expect("renamed"))
+
+    assert((bits_for(s, "before") & libuv.FS_RENAME) != 0, "the old name went")
+    assert((bits_for(s, "after") & libuv.FS_RENAME) != 0, "and the new one came")
+
+    libuv.unlink_sync(dir + "/after").expect("removed")
+    libuv.rmdir_sync(dir).expect("removed")
+
+@test("changes that arrive while nobody waits are queued, in order, and the watcher keeps nothing alive")
+watch_queues()
+    val io = uv()
+    val lp = event_loop(io)
+    val dir = scratch_dir("queue")
+    val w = io.watch(dir).expect("watching")
+
+    assert(!io.on_loop().alive(), "a watcher nobody awaits keeps nothing running")
+
+    lp.block_on(lp.sleep(millis(SETTLE))).expect("slept")
+    libuv.write_file_sync(dir + "/one", [1]).expect("written")
+    lp.block_on(lp.sleep(millis(QUIET))).expect("slept")
+
+    val c = lp.block_on(lp.timeout(millis(5000), w.next())).expect("ran").expect("it arrived").expect("a change")
+
+    assert_eq(c.filename, Some("one"))
+    assert_eq(w.path().expect("a path"), dir)
+
+    w.close()
+    lp.block_on(w.next()).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ECANCELED)
+        Ok(_) -> assert(false, "a closed watcher answered")
+
+    lp.run()
+    libuv.unlink_sync(dir + "/one").expect("removed")
+    libuv.rmdir_sync(dir).expect("removed")
+
+private watch_and_drop(io: &Uv, dir: string)
+    val w = io.watch(dir).expect("watching")
+
+    assert(w.path().is_ok(), "it was watching")
+
+@test("a watcher dropped without closing releases its handle")
+watch_dropped()
+    val io = uv()
+    val lp = event_loop(io)
+    val dir = scratch_dir("drop")
+
+    watch_and_drop(io, dir)
+    lp.run()
+    assert(!io.on_loop().alive(), "nothing is left")
+    libuv.rmdir_sync(dir).expect("removed")
+
+@test("a path that is not there is ENOENT, from watch itself")
+watch_missing()
+    val io = uv()
+    val lp = event_loop(io)
+
+    io.watch("/tmp/sysl-kairos-watch-test-nothing-here") match
+        Err(e) -> assert_eq(e.code, libuv.ENOENT)
+        Ok(_) -> assert(false, "watched a path that is not there")
+
+    lp.run()
+    assert(!io.on_loop().alive(), "the failed watcher was closed")
+
+// -- The environment a child is given ------------------------------------------------------------
+
+private async output_of(p: &Process) -> string
+    var out: Buf[u8] = buf()
+    val pipe = p.stdout().expect("piped")
+
+    loop
+        val got = (await pipe.read()).expect("read")
+
+        if got.len == 0 then break
+
+        out.extend(got)
+
+    from_utf8_lossy(out.view())
+
+@test("env_add is this process's environment plus the entries, and an entry replaces one of its name")
+spawn_env_add()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "echo $PATH:$KAIROS_ADDED:$HOME"], stdout = Piped,
+                     env_add = ["KAIROS_ADDED=yes", "HOME=/elsewhere"]).expect("spawned")
+    val text = lp.block_on(output_of(p)).expect("ran")
+
+    assert(text.ends_with(":yes:/elsewhere\n"), "added and overridden: " + text)
+    assert(text.len > ":yes:/elsewhere\n".len, "and PATH was inherited, so it is not empty")
+    lp.block_on(p.exit()).expect("ran")
+    lp.run()
+
+@test("env_add on top of env adds to env, not to this process's environment")
+spawn_env_add_on_env()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "echo [$HOME][$ONE][$TWO]"], stdout = Piped,
+                     env = ["ONE=1", "TWO=2"], env_add = ["TWO=22"]).expect("spawned")
+
+    assert_eq(lp.block_on(output_of(p)).expect("ran"), "[][1][22]\n")
+    lp.block_on(p.exit()).expect("ran")
+    lp.run()
+
+@test("a spawn with neither env nor env_add inherits, as before")
+spawn_env_inherits()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "echo [$KAIROS_ADDED]"], stdout = Piped).expect("spawned")
+
+    assert_eq(lp.block_on(output_of(p)).expect("ran"), "[]\n")
+    lp.block_on(p.exit()).expect("ran")
+    lp.run()
+
+// -- append_file ---------------------------------------------------------------------------------
+
+@test("append_file adds to the end, creates a missing file, and a directory is an error")
+append_file_adds()
+    val io = uv()
+    val lp = event_loop(io)
+    val path = "/tmp/sysl-kairos-append-test"
+
+    libuv.unlink_sync(path) match
+        _ -> ()
+
+    lp.block_on(io.append_file(path, "ab".bytes)).expect("ran").expect("created")
+    lp.block_on(io.append_file(path, "cd".bytes)).expect("ran").expect("appended")
+    lp.block_on(io.append_file(path, "".bytes)).expect("ran").expect("nothing appended")
+    assert_eq(from_utf8_lossy(lp.block_on(io.read_file(path)).expect("ran").expect("read")), "abcd")
+
+    lp.block_on(io.write_file(path, "z".bytes)).expect("ran").expect("rewritten")
+    lp.block_on(io.append_file(path, "y".bytes)).expect("ran").expect("appended")
+    assert_eq(from_utf8_lossy(lp.block_on(io.read_file(path)).expect("ran").expect("read")), "zy")
+
+    lp.block_on(io.append_file("/tmp", "x".bytes)).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.EISDIR)
+        Ok(_) -> assert(false, "appended to a directory")
+
+    libuv.unlink_sync(path).expect("removed")
+    lp.run()
+#endif

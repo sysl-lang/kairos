@@ -51,6 +51,22 @@ private[uv] async write_file_on(lp: &libuv.Loop, path: string, bytes: []const u8
     Ok(())
 end write_file_on
 
+private[uv] async append_file_on(lp: &libuv.Loop, path: string, bytes: []const u8) -> Result[unit, Error]
+    val flags = libuv.O_WRONLY | libuv.O_CREAT | libuv.O_APPEND
+    val f = (await open_on(lp, path, flags))?
+    var open = true
+    defer if open then libuv.close(f, ignore, lp)
+
+    var done: usize = 0
+
+    while done < bytes.len
+        done += (await write_on(lp, f, bytes[done..]))?
+
+    open = false
+    (await close_on(lp, f))?
+    Ok(())
+end append_file_on
+
 private async open_on(lp: &libuv.Loop, path: string, flags: i32) -> Result[libuv.File, Error]
     val p: &Pending[Result[libuv.File, Error]] = pending()
     defer p.abandon()

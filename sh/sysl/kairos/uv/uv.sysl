@@ -76,6 +76,16 @@ struct Uv
     write_file(self, path: string, bytes: []const u8) -> Task[Result[unit, Error]] =
         write_file_on(self.lp, path, bytes)
 
+    /** A task that appends `bytes` to the file at `path`, creating it if it is not there. */
+    append_file(self, path: string, bytes: []const u8) -> Task[Result[unit, Error]] =
+        append_file_on(self.lp, path, bytes)
+
+    /** Watch `path` for changes, taken one at a time with `next`; `recursive` asks for its
+     * subdirectories too, where the platform can. A path that is not there is `ENOENT`, from this call.
+     */
+    watch(self, path: string, recursive: bool = false) -> Result[&Watch, Error] =
+        watch_on(self.lp, path, recursive)
+
     /** A task that resolves `host` and `service` on libuv's thread pool, ending with every way the
      * resolver found to reach it, in the order it prefers. `flags` takes libuv's `AI_` constants;
      * `AI_NUMERICHOST` answers `EAI_NONAME` for a name rather than asking the network.
@@ -106,12 +116,17 @@ struct Uv
 
     /** Start `file` -- looked up on `PATH` unless it holds a slash -- with `args`, which do not
      * include its own name. `env` of `[]` inherits this process's environment, and anything else
-     * replaces it; `cwd` of `""` starts it here. A program that is not there is `ENOENT`, from this
-     * call.
+     * replaces it; `cwd` of `""` starts it here. `env_add` (`NAME=value` entries) is added on top of
+     * whichever environment that gives, replacing a variable of the same name -- so `env_add` alone is
+     * this process's environment plus those. A program that is not there is `ENOENT`, from this call.
      */
     spawn(self, file: string, args: []const string, env: []const string = [], cwd: string = "",
-          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit) -> Result[&Process, Error] =
-        spawn_on(self.lp, file, args, env, cwd, stdin, stdout, stderr)
+          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit,
+          env_add: []const string = []) -> Result[&Process, Error]
+        // Kept alive across the call: the child's environment is a view of it.
+        val merged = merged_env(env, env_add)
+
+        spawn_on(self.lp, file, args, merged.view(), cwd, stdin, stdout, stderr)
 
     /** A task that ends with `signum` at its next arrival, on a watcher of its own. */
     signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum)

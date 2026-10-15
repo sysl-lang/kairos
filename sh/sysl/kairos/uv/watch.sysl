@@ -1,0 +1,118 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Watching the file system, as a stream of changes taken one at a time.
+//
+//     val w = io.watch("site", true)?
+//     loop
+//         val change = (await w.next())?
+//         rebuild(change.filename)
+//
+// **This is the operating system's notification, not a poll**: FSEvents on macOS, inotify on Linux.
+// Watching a directory reports the names inside it, relative to the directory; watching a file reports
+// the file. One write may arrive as several changes or several as one, so a program that rebuilds on a
+// change looks at the file system again rather than trusting the change to say what is there.
+// Recursive watching is the platform's: macOS honours it, and on Linux libuv does not walk the tree.
+//
+// **A watcher keeps the loop running only while a task waits on it**, as `Signals` does. A change that
+// arrives while nobody waits is queued, in order, and the next `next` takes it.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.Handle
+import sysl.buf.{Buf, buf}
+
+/** One change: the name that changed, if the platform said, and `renamed()` / `changed()`. */
+type FsChange = libuv.FsChange
+
+/** A watcher for one path. Reached through `&Watch`; `close` stops it, and a watcher dropped without
+ * being closed is closed then.
+ */
+struct Watch
+    private watcher: &libuv.FsEvent
+    private queue: Buf[Result[FsChange, Error]]
+    private closed: bool
+    private waiter: Option[&Pending[unit]]
+
+    /** A task that ends with the next change -- or at once, with one that arrived while nobody
+     * waited. A failure the backend reports later arrives here as an `Err`. Dropping the task leaves
+     * the change for the next `next`. After `close` it ends with `ECANCELED`.
+     */
+    next(&self) -> Task[Result[FsChange, Error]] = next_change(self)
+
+    /** The path being watched, as it was given. */
+    path(self) -> Result[string, Error]
+        val w = self.watcher
+
+        Ok(w.path()?)
+
+    /** Stop watching. A task waiting in `next` ends with `ECANCELED`; changes already queued are
+     * dropped. Closing again does nothing.
+     */
+    close(*self)
+        close_handle(self.watcher)
+
+        self.closed = true
+        self.queue.clear()
+        self.wake()
+
+    // libuv's callback: one more change, and a task may be waiting for it.
+    private raised(*self, r: Result[FsChange, Error])
+        if self.closed then return
+
+        self.queue.push(r)
+        self.wake()
+
+    private wake(*self)
+        self.waiter match
+            Some(p) ->
+                self.waiter = None
+                p.finish(())
+            None -> ()
+end Watch
+
+impl Drop for Watch
+    drop(self) = close_handle(self.watcher)
+
+private[uv] watch_on(lp: &libuv.Loop, path: string, recursive: bool) -> Result[&Watch, Error]
+    val w = libuv.fs_event(lp)?
+    var s: &Watch = Watch(w, buf(), false, None)
+
+    // Weak, as a listener's callback is: the handle would otherwise hold the watcher for ever.
+    val held: weak Watch = s
+
+    w.start(path, (r) -> held.get() match
+        Some(it) -> it.raised(r)
+        None -> (), if recursive then libuv.FS_EVENT_RECURSIVE else 0) match
+        Err(e) ->
+            w.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    w.unref()
+    Ok(s)
+end watch_on
+
+private async next_change(s: &Watch) -> Result[FsChange, Error]
+    if s.queue.is_empty() && !s.closed
+        val p: &Pending[unit] = pending()
+        val w = s.watcher
+
+        // Counted by the loop only while it is awaited.
+        w.keep()
+        s.waiter = Some(p)
+        defer waited(s)
+        await settled(p)
+
+    if s.closed then return Err(cancelled())
+    if s.queue.is_empty() then return Err(cancelled())
+
+    s.queue.remove(0)
+end next_change
+
+private waited(s: &Watch)
+    val w = s.watcher
+
+    s.waiter = None
+    if !w.is_closing() then w.unref()
+#endif

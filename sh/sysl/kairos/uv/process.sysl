@@ -18,6 +18,7 @@ module sh.sysl.kairos.uv
 import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 import sysl.buf.{Buf, buf}
+import sysl.env.vars
 
 /** What one of the child's standard streams is. */
 enum Stdio
@@ -113,6 +114,40 @@ private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: [
 
     Ok(p)
 end spawn_on
+
+// The environment a child is given: `env` (or this process's, where `env` is empty) with each `NAME=value`
+// of `add` replacing the entry of that name or joining the end. Empty when neither is given, which
+// spawn reads as "inherit".
+private[uv] merged_env(env: []const string, add: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if env.len == 0 && add.len == 0 then return out
+
+    if env.len > 0
+        for e in env do out.push(e)
+    else
+        for v in vars() do out.push(v.0 + "=" + v.1)
+
+    for a in add
+        val name = name_of(a)
+        var at: Option[usize] = None
+
+        for i in 0..<out.len()
+            if name_of(out.at(i)) == name then at = Some(i)
+
+        at match
+            Some(i) -> out.set(i, a)
+            None -> out.push(a)
+
+    out
+end merged_env
+
+// The part of a `NAME=value` entry before its first `=`; the whole entry where there is none.
+private name_of(entry: string) -> string
+    for i in 0..<entry.len
+        if entry[i] == u8('=') then return entry[0..<i]
+
+    entry
 
 private ignore_exit(status: i64, signal: i32) -> unit = ()
 
