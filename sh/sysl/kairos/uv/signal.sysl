@@ -13,7 +13,8 @@ module sh.sysl.kairos.uv
 //
 // **A watcher keeps the loop running only while a task waits on it**, which is node's rule: a
 // program whose one remaining thing is a handler for `SIGINT` ends, and one awaiting `SIGINT` waits.
-// A signal that arrives while nobody is waiting is counted, and the next `next` takes it.
+// A signal that arrives while nobody is waiting is counted, and the next `next` takes it. A watcher
+// put in the `background` does not keep the loop alive even while a task waits on it.
 
 import sh.sysl.libuv
 import sh.sysl.libuv.Handle
@@ -27,6 +28,36 @@ struct Signals
     private arrived: usize
     private closed: bool
     private waiter: Option[&Pending[unit]]
+    private quiet: &Quiet
+    private waiting: bool
+    private in_background: bool
+
+    /** Stop a task waiting in `next` from keeping the loop alive, which is node's rule for a signal
+     * handler: a program whose one remaining thing is a background `next` ends. The task is left
+     * parked, not cancelled, so a later run still hears the signal. It may be called while a task
+     * waits.
+     */
+    background(*self)
+        if self.in_background then return
+
+        self.in_background = true
+        if self.waiting
+            self.quiet.n += 1
+            if !self.watcher.is_closing() then self.watcher.unref()
+    end background
+
+    /** Count a waiting task again, as a watcher does when it is made. */
+    keep(*self)
+        if !self.in_background then return
+
+        self.in_background = false
+        if self.waiting
+            self.quiet.n -= 1
+            if !self.watcher.is_closing() then self.watcher.keep()
+    end keep
+
+    /** Whether it is in the background. */
+    is_background(self) -> bool = self.in_background
 
     /** A task that ends with the signal's number at its next arrival -- or at once, for one that
      * arrived while nobody waited. Dropping it leaves that arrival for the next `next`.
@@ -64,9 +95,9 @@ end Signals
 impl Drop for Signals
     drop(self) = close_handle(self.watcher)
 
-private[uv] signals_on(lp: &libuv.Loop, signum: i32) -> Result[&Signals, Error]
+private[uv] signals_on(lp: &libuv.Loop, signum: i32, quiet: &Quiet) -> Result[&Signals, Error]
     val w = libuv.signal(lp)?
-    var s: &Signals = Signals(w, signum, 0, false, None)
+    var s: &Signals = Signals(w, signum, 0, false, None, quiet, false, false)
 
     // Weak, as a listener's callback is: the handle would otherwise hold the watcher for ever.
     val held: weak Signals = s
@@ -88,8 +119,9 @@ private async next_of(s: &Signals) -> Result[i32, Error]
         val p: &Pending[unit] = pending()
         val w = s.watcher
 
-        // Counted by the loop only while it is awaited.
-        w.keep()
+        // Counted by the loop only while it is awaited, and then not in the background.
+        if s.is_background() then s.quiet.n += 1 else w.keep()
+        s.waiting = true
         s.waiter = Some(p)
         defer waited(s)
         await settled(p)
@@ -104,11 +136,12 @@ private waited(s: &Signals)
     val w = s.watcher
 
     s.waiter = None
-    if !w.is_closing() then w.unref()
+    s.waiting = false
+    if s.is_background() then s.quiet.n -= 1 else if !w.is_closing() then w.unref()
 
 /** The next arrival of `signum`, on a watcher of its own that is closed as the task ends. */
-private[uv] async signal_on(lp: &libuv.Loop, signum: i32) -> Result[i32, Error]
-    val s = signals_on(lp, signum)?
+private[uv] async signal_on(lp: &libuv.Loop, signum: i32, quiet: &Quiet) -> Result[i32, Error]
+    val s = signals_on(lp, signum, quiet)?
 
     defer s.close()
     await s.next()

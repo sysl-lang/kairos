@@ -1,0 +1,274 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// Notifiers and remotes across real threads on the libuv driver, and background waits: each loop is
+// woken by exactly the wake sent to it, a loop waiting on nothing but another thread blocks in the
+// kernel rather than turning over once a millisecond, and a background signal wait does not hold a
+// program open.
+
+import sh.sysl.libuv
+import sh.sysl.kairos.{Loop, Notifier, Waker, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.sync.Atomic
+import sysl.threads.Mutex
+import sysl.time.millis
+
+// Processor time this process has used, in microseconds: CLOCKS_PER_SEC is a million on both macOS
+// and Linux.
+@needs(os)
+private extern "clock" cpu_clock() -> long
+
+private struct Passes
+    n: int
+
+private passes() -> &Passes = Passes(0)
+
+@test("a notifier woken from another thread ends a loop's wait at once")
+notifier_wakes_across_threads()
+    val io = uv()
+    val lp = event_loop(io)
+    val n = lp.notifier()
+    val w = n.waker()
+    val start = io.now()
+    val t = libuv.thread(() ->
+        libuv.sleep(50)
+        w.wake()).expect("a thread")
+
+    val got = lp.block_on(lp.timeout(millis(5000), n.next())).expect("ran")
+
+    t.join().expect("joined")
+    assert(got.is_some(), "the wake ended next")
+    assert(io.now() - start < millis(1000), "and at once, not at the deadline")
+    assert(!io.on_loop().alive(), "the notifier keeps nothing of libuv's running")
+
+// A loop with nothing but a wait on another thread: the old driver slept in one-millisecond slices
+// and passed again after each, so the passes counted here were in the hundreds.
+private assert_blocks(lp: &Loop[Uv], io: &Uv, t: Task[unit], label: string)
+    val count = passes()
+
+    lp.check((l) -> count.n += 1)
+
+    val c0 = cpu_clock()
+    val start = io.now()
+
+    lp.block_on(t).expect("ran")
+
+    val cpu_us = cpu_clock() - c0
+
+    assert(io.now() - start >= millis(250), s"$label: the wake came from the thread")
+    assert(count.n < 10, s"$label: ${count.n} passes in a 300 ms wait -- the loop is turning over")
+    assert(cpu_us < 50000, s"$label: $cpu_us us of processor time in a 300 ms wait")
+end assert_blocks
+
+@test("a loop waiting only on a notifier blocks in the kernel and uses no processor time")
+notifier_wait_does_not_spin()
+    val io = uv()
+    val lp = event_loop(io)
+    val n = lp.notifier()
+    val w = n.waker()
+    val t = libuv.thread(() ->
+        libuv.sleep(300)
+        w.wake()).expect("a thread")
+
+    assert_blocks(lp, io, n.next(), "notifier")
+    t.join().expect("joined")
+
+private async raised(lp: &Loop[Uv], n: u32)
+    (await lp.wait_for(n)).expect("the source is free")
+
+@test("a loop waiting only on a remote's source blocks in the kernel and uses no processor time")
+remote_wait_does_not_spin()
+    val io = uv()
+    val lp = event_loop(io)
+    val r = lp.remote(6).expect("a remote")
+    val t = libuv.thread(() ->
+        libuv.sleep(300)
+        r.raise()).expect("a thread")
+
+    assert_blocks(lp, io, raised(lp, 6), "remote")
+    t.join().expect("joined")
+
+// -- A thousand and twenty-four loops -----------------------------------------------------------
+
+private const loops: int = 1024
+
+private struct Board
+    wakers: Mutex[Buf[Option[Waker]]]
+    ended: Mutex[Buf[int]]
+    published: Atomic[u32]
+
+// One loop on its own thread and its own libuv loop: publish the waker, wait for one wake with no
+// deadline, say so, and close everything.
+private actor(b: &sync Board, i: int)
+    val l = libuv.new_loop().expect("a loop")
+    val io = uv_on(l)
+    val lp = event_loop(io)
+    val n = lp.notifier()
+    val w = n.waker()
+
+    b.wakers.with((ws) -> (*ws)[usize(i)] = Some(w))
+    b.published.add(1)
+
+    lp.block_on(n.next()).expect("ran")
+    b.ended.with((e) -> e.push(i))
+
+    io.close()
+    l.close().expect("nothing of the loop's is left open")
+end actor
+
+private ended(b: &sync Board) -> usize = b.ended.with((e) -> e.len())
+
+private waker_of(b: &sync Board, i: int) -> Waker =
+    b.wakers.with((ws) -> (*ws)[usize(i)]).expect("published")
+
+@test("1,024 loops on threads, each woken alone: no wake reaches another, and none spins while waiting")
+a_thousand_loops()
+    var slots: Buf[Option[Waker]] = buf()
+    for i in 0..<loops do slots.push(None)
+
+    val b: &sync Board = Board(Mutex.new(slots), Mutex.new(buf()), Atomic(0))
+    var threads: Buf[&sync libuv.Thread] = buf()
+
+    for i in 0..<loops
+        threads.push(libuv.thread_with_stack(() -> actor(b, i), 1 << 20).expect("a thread"))
+
+    var spins = 0
+    while b.published.load() < u32(loops)
+        libuv.sleep(1)
+        spins += 1
+        assert(spins < 30000, "every loop published its waker")
+
+    // Every loop is now in, or about to be in, a wait with no deadline. Spinning at a thousand
+    // passes a second each, they would use seconds of processor time in this fifth of one.
+    val c0 = cpu_clock()
+    libuv.sleep(200)
+    val idle_us = cpu_clock() - c0
+    assert(idle_us < 100000, s"$idle_us us of processor time while $loops loops waited")
+
+    for k in 0..<loops
+        waker_of(b, k).wake()
+
+        var waited = 0
+        while ended(b) <= usize(k)
+            libuv.sleep(1)
+            waited += 1
+            assert(waited < 5000, s"loop $k ended on its wake")
+
+    for t in threads.view() do t.join().expect("joined")
+
+    // Woken in order, they ended in order: a wake that reached a second loop would have ended it
+    // early, out of turn.
+    b.ended.with((e) ->
+        assert_eq(e.len(), usize(loops))
+        for i in 0..<loops do assert_eq((*e)[usize(i)], i))
+end a_thousand_loops
+
+// -- Background waits ---------------------------------------------------------------------------
+
+private async forever_on(s: &Signals, heard: &Passes)
+    // Until the watcher is closed, which ends a waiting next with ECANCELED.
+    loop
+        if (await s.next()).is_err() then return
+        heard.n += 1
+
+@test("a background signal wait does not keep run going, and is left parked to hear a later signal")
+background_signal_wait()
+    val io = uv()
+    val lp = event_loop(io)
+    val s = io.signals(libuv.SIGUSR2).expect("a watcher")
+    val heard = passes()
+
+    s.background()
+    assert(s.is_background())
+    lp.spawn(forever_on(s, heard))
+
+    // Nothing else is alive: run returns, where a kept watcher would have it wait for ever.
+    lp.run()
+    assert_eq(lp.running(), 1)
+    assert(!io.on_loop().alive(), "the watcher is not counted by libuv")
+
+    // Parked, not cancelled: a signal and a run that waits for it are still heard.
+    lp.after(millis(20), (l) -> libuv.kill(libuv.pid(), libuv.SIGUSR2).expect("sent"))
+    lp.after(millis(200), (l) -> l.stop())
+    lp.run()
+    assert_eq(heard.n, 1)
+    assert_eq(lp.running(), 1)
+
+    s.close()
+    lp.run()
+    assert_eq(lp.running(), 0)
+end background_signal_wait
+
+@test("a signal wait toggled to the background and back keeps the loop alive only while kept")
+signal_wait_toggles()
+    val io = uv()
+    val lp = event_loop(io)
+    val s = io.signals(libuv.SIGUSR2).expect("a watcher")
+    val heard = passes()
+
+    lp.spawn(forever_on(s, heard))
+    lp.after(millis(10), (l) -> s.background())
+    lp.run()
+
+    // Kept at first, it held the loop until the toggle at 10 ms.
+    assert(io.now() >= millis(10))
+    assert_eq(lp.running(), 1)
+    assert(!io.on_loop().alive())
+
+    s.keep()
+    assert(!s.is_background())
+    assert(io.on_loop().alive(), "kept again, libuv counts it")
+
+    lp.after(millis(20), (l) -> libuv.kill(libuv.pid(), libuv.SIGUSR2).expect("sent"))
+    lp.after(millis(100), (l) -> s.close())
+    lp.run()
+
+    assert_eq(heard.n, 1)
+    assert_eq(lp.running(), 0)
+end signal_wait_toggles
+
+@test("a background notifier wait on the libuv driver lets run end, and a wake from a thread later ends it")
+background_notifier_on_uv()
+    val io = uv()
+    val lp = event_loop(io)
+    val n = lp.notifier()
+    val w = n.waker()
+    val done = passes()
+
+    n.background()
+    lp.spawn(notified_once(n, done))
+    lp.run()
+    assert_eq(lp.running(), 1)
+
+    n.keep()
+    val t = libuv.thread(() ->
+        libuv.sleep(30)
+        w.wake()).expect("a thread")
+
+    lp.run()
+    t.join().expect("joined")
+    assert_eq(done.n, 1)
+    assert_eq(lp.running(), 0)
+end background_notifier_on_uv
+
+private async notified_once(n: &Notifier, done: &Passes)
+    await n.next()
+    done.n += 1
+
+@test("close frees the driver's handles, so a loop of the program's own closes")
+close_frees_the_handles()
+    val l = libuv.new_loop().expect("a loop")
+    val io = uv_on(l)
+    val lp = event_loop(io)
+
+    lp.notifier().waker().wake()
+    lp.run()
+
+    // Before close, the timer and the async are still the loop's.
+    assert(l.close().is_err(), "EBUSY while the driver's handles are open")
+
+    io.close()
+    assert(l.close().is_ok())
+#endif

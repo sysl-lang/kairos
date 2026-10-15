@@ -491,7 +491,7 @@ many_jobs()
 remote_wakes_the_loop()
     val io = uv()
     val lp = event_loop(io)
-    val r = io.remote(5).expect("a remote")
+    val r = lp.remote(5).expect("a remote")
     val start = io.now()
     val t = libuv.thread(() ->
         libuv.sleep(50)

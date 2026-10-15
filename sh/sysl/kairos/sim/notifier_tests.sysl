@@ -1,0 +1,281 @@
+module sh.sysl.kairos.sim
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, millis, whole_micros}
+import sh.sysl.kairos.{Loop, Notifier, Waker, event_loop, signalled, OutOfRange, Stalled, NoWait}
+
+/** Notifiers, remotes and background waits on the simulated driver, one thread: what a wake ends,
+ * that wakes coalesce and are kept, what keeps a loop alive and what is left parked rather than
+ * cancelled, and that a remote raises its own loop's source and no other loop's. The wakes come from
+ * timer callbacks, which is where a pass would find them had another thread sent them.
+ *
+ * Each test asserts no source of the process-wide interrupt word is raised, before and after: a
+ * remote does not go through it.
+ */
+
+private ms(lp: &Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private ms(lp: *Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private in_ms(d: Option[Duration]) -> long = d match
+    Some(v) -> whole_micros(v) / 1000
+    None -> -1
+
+private async next_logged(lp: &Loop[Sim], n: &Notifier, log: &Buf[string], name: string)
+    defer log.push(s"$name closed")
+    await n.next()
+    log.push(s"$name woke@${ms(lp)}")
+
+private async next_within(lp: &Loop[Sim], n: &Notifier, d: long) -> bool =
+    (await lp.timeout(millis(d), n.next())).is_some()
+
+// A waker whose notifier nothing holds once this returns.
+private orphan_waker(lp: &Loop[Sim]) -> Waker = lp.notifier().waker()
+
+@test("a wake ends the task waiting in next, in the pass the wake came in")
+wake_ends_next()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val n = lp.notifier()
+    val w = n.waker()
+    val log: &Buf[string] = buf()
+
+    lp.spawn(next_logged(lp, n, log, "a"))
+    lp.after(millis(7), (l) -> w.wake())
+    lp.run()
+
+    assert_eq(log.view(), ["a woke@7", "a closed"])
+    assert_eq(lp.running(), 0)
+    assert(!signalled())
+end wake_ends_next
+
+@test("wakes before a next are one wake, kept until a next takes it")
+wakes_coalesce_and_are_kept()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val n = lp.notifier()
+    val w = n.waker()
+
+    lp.after(millis(2), (l) ->
+        w.wake()
+        w.wake())
+
+    // Asleep until 5: the wakes at 2 wait for it.
+    val first = lp.block_on(async_after(lp, 5, next_within(lp, n, 1))).expect("ran")
+    assert(first, "the kept wake ends the first next at once")
+
+    val second = lp.block_on(next_within(lp, n, 10)).expect("ran")
+    assert(!second, "two wakes were one: the second next waits out its timeout")
+    assert_eq(ms(lp), 15)
+    assert(!signalled())
+end wakes_coalesce_and_are_kept
+
+private async async_after(lp: &Loop[Sim], d: long, t: Task[bool]) -> bool
+    await lp.sleep(millis(d))
+    await t
+
+@test("a notifier nothing waits on keeps nothing alive")
+idle_notifier_keeps_nothing()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val n = lp.notifier()
+
+    n.waker().wake()
+    lp.run()
+
+    assert(!lp.alive())
+    assert_eq(s.waits().len, 0)
+end idle_notifier_keeps_nothing
+
+@test("a task waiting in next keeps the loop alive until the wake")
+waiting_keeps_alive()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val n = lp.notifier()
+    val w = n.waker()
+    val log: &Buf[string] = buf()
+
+    lp.spawn(next_logged(lp, n, log, "a"))
+    lp.pass(NoWait)
+    assert(lp.alive(), "the wait alone keeps it alive")
+
+    lp.after(millis(4), (l) -> w.wake())
+    lp.run()
+
+    assert_eq(log.view(), ["a woke@4", "a closed"])
+    assert(!lp.alive())
+end waiting_keeps_alive
+
+@test("a background wait keeps nothing alive, and run leaves it parked rather than cancelling it")
+background_wait_is_left_parked()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val n = lp.notifier()
+    val log: &Buf[string] = buf()
+
+    n.background()
+    assert(n.is_background())
+    lp.spawn(next_logged(lp, n, log, "a"))
+    lp.run()
+
+    assert_eq(log.len(), 0)
+    assert_eq(lp.running(), 1)
+    assert(!lp.alive())
+    assert_eq(s.waits().len, 0)
+
+    // The wait could still end, and does on a later run.
+    n.waker().wake()
+    lp.run()
+
+    assert_eq(log.view(), ["a woke@0", "a closed"])
+    assert_eq(lp.running(), 0)
+end background_wait_is_left_parked
+
+@test("background and keep toggle while a task waits")
+background_toggles_while_waiting()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val n = lp.notifier()
+    val w = n.waker()
+    val log: &Buf[string] = buf()
+
+    lp.spawn(next_logged(lp, n, log, "a"))
+    lp.after(millis(3), (l) -> n.background())
+    lp.run()
+
+    // Put in the background at 3, the wait no longer held the loop.
+    assert_eq(ms(lp), 3)
+    assert_eq(lp.running(), 1)
+    assert(!lp.alive())
+
+    n.keep()
+    assert(!n.is_background())
+    assert(lp.alive(), "kept again, it holds the loop")
+
+    lp.after(millis(4), (l) -> w.wake())
+    lp.run()
+
+    assert_eq(log.view(), ["a woke@7", "a closed"])
+
+    // Toggled with nobody waiting, and twice over, the counts stay balanced.
+    n.background()
+    n.background()
+    n.keep()
+    n.keep()
+    assert(!lp.alive())
+end background_toggles_while_waiting
+
+private async forever()
+    await park((w) -> ())
+
+@test("block_on's stall drops its own task and leaves a background waiter parked")
+stall_leaves_background_waiter()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val n = lp.notifier()
+    val log: &Buf[string] = buf()
+
+    n.background()
+    lp.spawn(next_logged(lp, n, log, "a"))
+
+    assert_eq(lp.block_on(forever()), Err(Stalled(2)))
+    assert_eq(lp.running(), 1)
+    assert_eq(log.len(), 0)
+
+    // Without the background wait, the same stall cancels everything parked.
+    n.keep()
+    n.waker().wake()
+    lp.run()
+    assert_eq(log.view(), ["a woke@0", "a closed"])
+
+    lp.spawn(forever())
+    assert_eq(lp.block_on(forever()), Err(Stalled(2)))
+    assert_eq(lp.running(), 0)
+end stall_leaves_background_waiter
+
+@test("a wake reaches its own notifier and no other, on its loop or another")
+no_cross_talk_between_notifiers()
+    assert(!signalled())
+    val a = event_loop(sim())
+    val b = event_loop(sim())
+    val na = a.notifier()
+    val na2 = a.notifier()
+    val nb = b.notifier()
+
+    na.waker().wake()
+
+    assert(!b.block_on(next_within(b, nb, 5)).expect("ran"), "b's notifier was not woken")
+    assert(!a.block_on(next_within(a, na2, 5)).expect("ran"), "nor a's other one")
+    assert(a.block_on(next_within(a, na, 5)).expect("ran"), "a's was")
+    assert(!signalled())
+end no_cross_talk_between_notifiers
+
+@test("a remote raises its own loop's source, not the process's, and no other loop sees it")
+remote_raises_its_own_loop()
+    assert(!signalled())
+    val a = event_loop(sim())
+    val b = event_loop(sim())
+    val log: &Buf[string] = buf()
+
+    a.on(3, (l) -> log.push(s"a3@${ms(l)}")).expect("free")
+    b.on(3, (l) -> log.push(s"b3@${ms(l)}")).expect("free")
+
+    val r = a.remote(3).expect("in range")
+    assert_eq(r.number(), 3)
+
+    r.raise()
+    assert(!signalled(), "the process-wide word is untouched")
+    assert_eq(in_ms(a.timeout()), 0)
+    assert_eq(in_ms(b.timeout()), -1)
+
+    // b drains before a does, and finds nothing of a's.
+    b.after(millis(1), (l) -> l.off(3))
+    b.run()
+    a.after(millis(2), (l) -> l.off(3))
+    a.run()
+
+    assert_eq(log.view(), ["a3@0"])
+    assert(!signalled())
+end remote_raises_its_own_loop
+
+@test("a remote for a source out of range is refused")
+remote_out_of_range()
+    val lp = event_loop(sim())
+
+    assert(lp.remote(31).is_ok())
+    lp.remote(32) match
+        Err(OutOfRange(n)) -> assert_eq(n, 32)
+        _ -> assert(false, "32 is out of range")
+
+@test("timeout is zero while a wake is pending, and None once it is taken")
+timeout_sees_a_pending_wake()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val n = lp.notifier()
+
+    assert_eq(in_ms(lp.timeout()), -1)
+    n.waker().wake()
+    assert_eq(in_ms(lp.timeout()), 0)
+
+    lp.pass(NoWait)
+    assert_eq(in_ms(lp.timeout()), -1)
+end timeout_sees_a_pending_wake
+
+@test("a waker that outlives its notifier wakes nothing, and the loop forgets the notifier")
+orphan_waker_is_harmless()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val w = orphan_waker(lp)
+    val log: &Buf[string] = buf()
+
+    w.wake()
+    lp.after(millis(1), (l) -> log.push(s"t@${ms(l)}"))
+    lp.run()
+
+    assert_eq(log.view(), ["t@1"])
+    assert_eq(in_ms(lp.timeout()), -1)
+end orphan_waker_is_harmless

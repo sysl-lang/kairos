@@ -48,6 +48,15 @@ private[kairos] async wait_on[D: Driver](lp: &Loop[D], n: u32) -> Result[unit, S
     await park((w) -> raised.arm(w))
     Ok(())
 
+private[kairos] async notified(n: &Notifier)
+    if !n.has_wake()
+        n.begin_wait()
+        defer n.end_wait()
+
+        await park((w) -> n.arm(w))
+
+    n.consume()
+
 /** A timeout's two events: the task it runs was woken, or the deadline passed. */
 private struct Race
     woken: bool

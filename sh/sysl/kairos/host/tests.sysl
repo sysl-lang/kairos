@@ -2,8 +2,9 @@ module sh.sysl.kairos.host
 @tests
 
 import sysl.time.{millis, whole_micros}
-import sysl.posix.time.monotonic
-import sh.sysl.kairos.{Loop, event_loop}
+import sysl.posix.time.{monotonic, sleep}
+import sysl.threads.spawn
+import sh.sysl.kairos.{Loop, Remote, Waker, event_loop}
 
 private async two_naps(lp: &Loop[Host]) -> long
     await lp.sleep(millis(10))
@@ -22,3 +23,32 @@ host_sleeps_take_real_time()
     assert(took >= 25)
     assert(took < 1000)
 end host_sleeps_take_real_time
+
+private struct Raiser
+    r: Remote
+    w: Waker
+
+// On another thread: wait 30 ms, then raise the remote and wake the notifier.
+private raise_later(s: *Raiser) -> unit
+    sleep(millis(30))
+    s.r.raise()
+    s.w.wake()
+
+@test("on the host driver a remote and a notifier woken from another thread end the loop's wait")
+host_wakes_across_threads()
+    val lp = event_loop(host())
+    val n = lp.notifier()
+    var s = Raiser(lp.remote(4).expect("in range"), n.waker())
+    val started = monotonic()
+    val t = spawn(&raise_later, &s).unwrap()
+
+    // Five seconds each: only the wakes end them sooner.
+    val got = lp.block_on(lp.timeout(millis(5000), lp.wait_for(4))).expect("ran")
+    val woke = lp.block_on(lp.timeout(millis(5000), n.next())).expect("ran")
+    val took = whole_micros(monotonic() - started) / 1000
+
+    assert(t.join())
+    assert(got.is_some(), "the source was raised")
+    assert(woke.is_some(), "the notifier was woken")
+    assert(took < 1000, s"noticed within slices, not at the deadline: $took ms")
+end host_wakes_across_threads

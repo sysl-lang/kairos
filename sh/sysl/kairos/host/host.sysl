@@ -1,6 +1,7 @@
 module sh.sysl.kairos.host
 @requires(posix)
 
+import sysl.sync.Atomic
 import sysl.time.{Duration, millis}
 import sysl.posix.time.{monotonic, sleep}
 import sh.sysl.kairos.{Driver, signalled}
@@ -10,22 +11,36 @@ import sh.sysl.kairos.{Driver, signalled}
  * Time is counted from when the driver was made. A host has no interrupts, but `signal` is one
  * atomic OR and is safe from any thread, so a second thread standing in for a peripheral can raise a
  * source. Nothing can wake a `nanosleep` when it does, so `idle_until` sleeps in slices of at most a
- * millisecond and looks at `signalled` between them: a signal is noticed within a millisecond.
+ * millisecond and looks at `signalled` between them: a signal is noticed within a millisecond. A
+ * notifier woken or a remote raised from another thread is noticed the same way.
  */
 struct Host
     private origin: Duration
+    private rung: &sync Rung
+
+// Set by the waker a notifier or remote calls from another thread, and looked at between slices.
+private struct Rung
+    set: Atomic[u32]
 
 /** A host driver whose clock starts at zero now. */
-host() -> &Host = Host(monotonic())
+host() -> &Host
+    val r: &sync Rung = Rung(Atomic(0))
+
+    Host(monotonic(), r)
 
 private const slice_ms: long = 1
 
 impl Driver for Host
     now(*self) -> Duration = monotonic() - self.origin
 
+    override waker(*self) -> &sync Fn() -> unit
+        val r = self.rung
+
+        () -> r.set.store(1)
+
     idle_until(*self, deadline: Option[Duration])
         loop
-            if signalled() then return
+            if signalled() || self.rung.set.swap(0) != 0 then return
 
             val slice = millis(slice_ms)
 

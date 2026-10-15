@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.4" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.5" }
 }
 ```
 
@@ -166,6 +166,39 @@ kairos's timers are not libuv's, so libuv's `uv_backend_timeout` cannot see them
 woken; `timeout()` adds both. The `uv` driver answers `None` rather than libuv's zero for a libuv loop
 with nothing alive, which would otherwise spin the embedder.
 
+## Other threads, and background waits
+
+A loop belongs to the thread that runs it. Another thread reaches it through a value it is handed,
+and reaches that loop and no other:
+
+| | |
+|---|---|
+| `lp.notifier()` | a `&Notifier`: a doorbell of this loop's own |
+| `n.waker()` | a `Waker`, a copyable value safe on any thread; `w.wake()` wakes `n` and ends the loop's wait |
+| `await n.next()` | ends at the next wake, or at once if one came since the last `next` took it |
+| `lp.remote(k)` | a `Remote` whose `raise()` raises source `k` of this loop — not the process's — and ends its wait; `Err(OutOfRange(k))` past 31 |
+| `n.background()`, `n.keep()` | stop and start counting a task waiting in `next` as keeping the loop alive; either may be called while it waits |
+| `s.background()`, `s.keep()` | the same for a `uv` signal watcher, which is node's rule for a signal handler |
+
+**Wakes coalesce**: any number of them before a `next` takes them are one, so the task woken goes and
+looks at whatever the other threads left behind — a mailbox — rather than counting. One task waits
+on a notifier at a time. A notifier keeps the loop alive only while a task waits on it, and not in
+the background. A wake is a flag of the notifier's own, so a thousand loops on a thousand threads are
+each woken by exactly the wakes sent to them.
+
+**A background wait is left parked, not cancelled.** When nothing else is left, `run` ends rather
+than waiting for it, and leaves every parked task where it is, since the wait may still end — a later
+`run` or `pass` hears it. Without one, `run` cancels what nothing can wake, as before.
+
+The wake is the driver's: `Driver.waker` answers the closure a wake calls after setting its flag. The
+`uv` driver sends a `uv_async` it makes on the first ask, so a loop waiting on nothing but another
+thread blocks in the kernel and uses no processor time; the host driver notices within its
+millisecond slice; a board's default is nothing, since WFI wakes for any interrupt, and a second
+core's is `sev`. **The loop has to outlive every waker and remote** made from it.
+
+`signal(n)` stays the interrupt half: one word for the whole process, drained by whichever loop
+passes first, which on a board is the only one. Threads use a remote.
+
 ## The interrupt contract
 
 `signal` is one atomic OR into a word of module storage:
@@ -196,6 +229,9 @@ trait Driver
 
     backend_fd(*self) -> Option[int] = None
     backend_timeout(*self) -> Option[Duration] = None
+
+    waker(*self) -> &sync Fn() -> unit = () -> ()
+    quiet(*self) -> bool = false
 ```
 
 The machine is a value chosen in code — `event_loop(host())`, `event_loop(sim())`, a board's — and the
@@ -211,7 +247,10 @@ but an interrupt can land between that check and the sleep.
 libuv one: `busy` keeps the loop alive while the driver holds work a task waits on, and `poll` takes
 in what has already happened, on a pass that does not idle. `backend_fd` and `backend_timeout` are
 for embedding ([above](#driving-the-loop-yourself-and-embedding-it)): the descriptor an embedder
-waits on, and the longest it may wait before the driver has something of its own to do.
+waits on, and the longest it may wait before the driver has something of its own to do. `waker` is
+what a notifier or remote calls from another thread to end the driver's wait — it must neither
+allocate nor block — and `quiet` says a task waits in the background on something of the driver's
+([above](#other-threads-and-background-waits)).
 
 Two ship in the core, and a third behind the `uv` feature ([below](#the-uv-feature-libuv-sockets-and-files)):
 
@@ -223,8 +262,8 @@ Two ship in the core, and a third behind the `uv` feature ([below](#the-uv-featu
   rather than hanging the suite.
 - **`sh.sysl.kairos.host`** — the host's monotonic clock, for demos. It carries `@requires(posix)` on
   its own module, so the core and a board build never ask for an operating system. It sleeps in
-  slices of a millisecond, checking `signalled()` between them, so a second thread standing in for a
-  peripheral is noticed within a millisecond.
+  slices of a millisecond, checking `signalled()` and its waker's flag between them, so a second
+  thread standing in for a peripheral, or waking a notifier, is noticed within a millisecond.
 
 **The board driver comes with the board.** It is the trait above and nothing more: `now` reads a
 SysTick-driven tick count (or a free-running timer), and `idle_until` masks interrupts, returns if
@@ -248,7 +287,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.4", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.5", features = [uv] }
 }
 ```
 
@@ -297,9 +336,9 @@ lp.run()
 | `ch.write_handle(bytes, h)` | a task sending `PassConnection(c)`, `PassListener(l)` or `PassPipe(p)` beside `bytes` over a channel; each side keeps, and closes, its own descriptor |
 | `ch.read_handles()` | a task ending with a `Message`: the bytes, and each handle sent with them as `PassedSocket(s)` (taken with `s.connection()` or `s.listen()`) or `PassedPipe(p)` |
 | `proc.exit()`, `proc.kill(signum)`, `proc.pid()` | a task ending with how the child ended (`Exit`'s `status` or `signal`); `kill` after it has exited is `ESRCH`, never a signal to a process that has taken over its id |
-| `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival |
+| `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival, and which `background()` stops holding the loop open |
 | `io.work(job)` | a task running a `&sync Fn() -> T` on the thread pool; dropping it takes a job no thread has started off the queue |
-| `io.remote(n)` | a `Remote` another thread calls `raise()` on: source `n` is raised and libuv woken at once |
+| `io.close()` | close the driver's own libuv handles — its timer and its `uv_async` — so a libuv loop of the program's own (`uv_on(l)`) can then `l.close()`, as an actor's thread does before it ends |
 
 A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection,
 listener, pipe or signal watcher ends a task waiting on it with `ECANCELED`. Closing twice does nothing, and a connection
@@ -309,9 +348,9 @@ and does not keep the loop alive.
 `idle_until` runs libuv once, with a libuv timer set for the deadline, so a socket wakes the loop as
 a source does. `busy` is libuv's own answer to whether its loop is alive — an open listener, a read
 or request in flight, a handle still closing — so `run` drains closes before it returns, and a task
-waiting on nothing libuv watches is still cancelled when nothing else is left. A `signal` from another
-thread is noticed at libuv's next event or deadline, or within a millisecond when libuv has nothing
-to wait for.
+waiting on nothing libuv watches is still cancelled when nothing else is left. A notifier's or
+remote's wake from another thread sends the driver's `uv_async`, which ends libuv's wait at once;
+`io.remote(n)` is gone in 0.1.5, for `lp.remote(n)` ([above](#other-threads-and-background-waits)).
 
 ## What it needs
 
@@ -407,7 +446,12 @@ standard streams both ways, a socket pair, signals caught by task and by stream,
 call and a `File` read and written at offsets, a job on the thread pool, and a remote raised from
 another thread. An embedder over `poll(2)` on `backend_fd`, waiting for `timeout()` and driving
 `pass(NoWait)`, runs kairos timers, a TCP echo, a read under a timeout and a child with no timer at
-all, failing on a wait that would have been for ever and on a thousand waits.
+all, failing on a wait that would have been for ever and on a thousand waits. Notifiers and remotes
+are checked on the simulated driver for coalescing, what keeps a loop alive, background waits left
+parked rather than cancelled, and no cross-talk between notifiers or loops; on the host driver across
+a real thread; and on the `uv` driver with 1,024 loops on 1,024 threads, each woken alone and in turn,
+with the process's processor time measured while all of them wait — and a loop waiting only on another
+thread counted at a handful of passes in 300 ms, where the old one-millisecond slice made hundreds.
 ASan instruments the sysl half only: libuv is a `pkg_config` library someone else compiled.
 
 ## License

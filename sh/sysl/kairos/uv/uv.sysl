@@ -21,6 +21,7 @@ module sh.sysl.kairos.uv
 import sh.sysl.libuv
 import sysl.time.{Duration, millis}
 import sysl.posix.time.{monotonic, sleep}
+import sh.sysl.libuv.Handle
 import sh.sysl.kairos.{Driver, signalled}
 
 /** libuv's answer to an operation that failed; `e.name()` is its short name (`ECONNREFUSED`). */
@@ -33,14 +34,18 @@ type Error = libuv.Error
  * in flight, a handle still closing -- so a task waiting on any of them keeps the kairos loop running,
  * and a task waiting on nothing libuv watches is cancelled when nothing else is left, as on any driver.
  *
- * A source raised by `signal` from another thread is noticed when libuv next returns: at the next
- * event or deadline, or within a millisecond when libuv has nothing to wait for.
+ * **Another thread reaches the loop through `lp.notifier()` or `lp.remote(n)`**, whose wakes send a
+ * `uv_async` of the driver's: libuv's wait ends at once, and a loop waiting on nothing else blocks in
+ * the kernel until one comes, using no time. A source raised with the process-wide `signal` from
+ * another thread is noticed only when libuv next returns: at the next event or deadline, or within a
+ * millisecond when libuv has nothing to wait for and no notifier or remote was made.
  */
 struct Uv
     private lp: &libuv.Loop
     private timer: &libuv.Timer
     private origin: Duration
     private notify: Option[&libuv.Async]
+    private quiets: &Quiet
 
     /** The libuv loop every handle and request this driver's operations make is on. */
     on_loop(self) -> &libuv.Loop = self.lp
@@ -136,10 +141,10 @@ struct Uv
         spawn_on(self.lp, file, args, merged.view(), cwd, stdin, stdout, stderr, extra)
 
     /** A task that ends with `signum` at its next arrival, on a watcher of its own. */
-    signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum)
+    signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum, self.quiets)
 
     /** A watcher for every arrival of `signum`, taken one at a time with `next`. */
-    signals(self, signum: i32) -> Result[&Signals, Error] = signals_on(self.lp, signum)
+    signals(self, signum: i32) -> Result[&Signals, Error] = signals_on(self.lp, signum, self.quiets)
 
     /** A task that ends with what the file system knows about `path`, following links. */
     stat(self, path: string) -> Task[Result[libuv.Stat, Error]] = stat_on(self.lp, path)
@@ -173,15 +178,23 @@ struct Uv
      */
     work[T](self, job: &sync Fn() -> T) -> Task[Result[T, Error]] = work_on(self.lp, job)
 
-    /** A handle another thread raises source `n` through, waking the loop at once. */
-    remote(*self, n: u32) -> Result[Remote, Error]
-        self.notify match
-            Some(a) -> Ok(remote_of(n, a))
-            None ->
-                val a = notifier_on(self.lp)?
+    /** Close the handles the driver made on the libuv loop -- its timer, and the `uv_async` its
+     * notifiers and remotes wake it through -- so a program can close a loop of its own afterwards
+     * (`l.close()`), as an actor's thread does before it ends. The driver is not used again, and no
+     * waker or remote of a kairos loop over it may be either.
+     */
+    close(*self)
+        close_handle(self.timer)
 
-                self.notify = Some(a)
-                Ok(remote_of(n, a))
+        self.notify match
+            Some(a) ->
+                close_handle(a)
+                self.notify = None
+            None -> ()
+
+        // The close callbacks run on libuv's next turn.
+        self.lp.run(libuv.RUN_NOWAIT).expect("libuv ran")
+    end close
 end Uv
 
 /** A driver over libuv's default loop, which is what a program with one loop wants. */
@@ -190,7 +203,11 @@ uv() -> &Uv = uv_on(libuv.default_loop())
 /** A driver over `lp`, a libuv loop of the program's own. */
 uv_on(lp: &libuv.Loop) -> &Uv =
     // uv_timer_init only records the handle on the loop; it has no failure to answer.
-    Uv(lp, libuv.timer(lp).expect("a timer on an initialised loop"), monotonic(), None)
+    Uv(lp, libuv.timer(lp).expect("a timer on an initialised loop"), monotonic(), None, Quiet(0))
+
+/** How many tasks wait on a watcher of this driver's that is in the background. */
+private[uv] struct Quiet
+    n: usize
 
 private const slice_ms: long = 1
 
@@ -218,8 +235,35 @@ impl Driver for Uv
                 if self.lp.alive()
                     self.lp.run(libuv.RUN_ONCE).expect("libuv ran")
                 else
-                    sleep(millis(slice_ms))
+                    self.notify match
+                        // Counted for this wait alone, so libuv blocks until a waker sends.
+                        Some(a) ->
+                            a.keep()
+                            self.lp.run(libuv.RUN_ONCE).expect("libuv ran")
+                            a.unref()
+                        None -> sleep(millis(slice_ms))
     end idle_until
+
+    // The async is made on the first ask and kept unreferenced, so it holds the libuv loop open only
+    // for a wait with nothing else in it. Its callback does nothing: ending libuv's wait is the whole
+    // of its job, and the kairos loop looks at what was raised when the wait returns.
+    override waker(*self) -> &sync Fn() -> unit
+        val a = self.notify match
+            Some(a) -> a
+            None ->
+                // uv_async_init fails only on a loop that cannot make its wake-up descriptor.
+                val a = libuv.notifier(nothing, self.lp).expect("an async on an initialised loop")
+
+                a.unref()
+                self.notify = Some(a)
+                a
+
+        val w = a.waker()
+
+        () -> w.send().unwrap_or(())
+    end waker
+
+    override quiet(*self) -> bool = self.quiets.n > 0
 
     override busy(*self) -> bool = self.lp.alive()
 

@@ -67,6 +67,15 @@ signalled() -> bool = pending.load() != 0
  * driver's events make readable, where there is one. `backend_timeout` is the longest the embedder may
  * wait on it before the driver has something of its own to do, and `None` where the driver sets no
  * limit. Neither counts the loop's own timers or tasks; `Loop.timeout` adds those.
+ *
+ * Two more are for other threads and quiet waits. `waker` answers the closure a `Notifier` or a
+ * `Remote` calls, from any thread, after it has set its flag: it must end the driver's current
+ * `idle_until`, or the next one if none is in progress, without allocating or blocking. The default
+ * does nothing, which is right for a board whose `idle_until` is WFI, since any interrupt ends it;
+ * a board with a second core overrides it with `sev`, and the libuv driver sends a `uv_async`. It is
+ * asked for once per loop, the first time a notifier or remote is made. `quiet` says a task waits on
+ * something of the driver's that does not keep the loop alive -- a background wait -- so `run` leaves
+ * parked tasks parked when it ends rather than cancelling them.
  */
 trait Driver
     now(*self) -> Duration
@@ -80,6 +89,10 @@ trait Driver
 
     backend_timeout(*self) -> Option[Duration] = None
 
+    waker(*self) -> &sync Fn() -> unit = () -> ()
+
+    quiet(*self) -> bool = false
+
 /** How far one `Loop.pass` may wait for something to happen, as libuv's `uv_run` modes say it. */
 enum PassMode
     /** Not at all: take in whatever the driver has ready, run what is due, and return. */
@@ -90,6 +103,147 @@ enum PassMode
 
     /** As `Once`, but no longer than `d`. */
     Until(d: Duration)
+
+/** What other threads reach one loop through: the sources raised for it by a `Remote`, whether any
+ * of its notifiers was woken, and the driver's wake. Every field is safe to touch from any thread.
+ */
+private struct Bell
+    raised: Atomic[u32]
+    rung: Atomic[u32]
+    ring: &sync Fn() -> unit
+
+/** One notifier's pending wake, set by its wakers and taken by its loop. */
+private struct Flag
+    set: Atomic[u32]
+
+/** The loop's count of tasks parked on a notifier: `held` ones keep it alive and `quiet` ones do not,
+ * but stop `run` cancelling what is parked when it ends.
+ */
+private struct Keeps
+    held: usize
+    quiet: usize
+
+/** Wakes one notifier from any thread. It is a value: copy it to as many threads as wake it.
+ *
+ * **The loop has to outlive it**: a waker whose loop's driver is gone wakes something that is not
+ * there, as a `uv_async_send` on a closed handle would. Its own flag and the loop's bell are boxes
+ * the waker holds, so a waker that outlives only its `Notifier` is harmless: nothing takes the wake.
+ */
+struct Waker
+    private flag: &sync Flag
+    private bell: &sync Bell
+
+    /** Wake the notifier, and end the loop's wait. Wakes before the loop gets to them are one wake.
+     * Safe from any thread, and it neither allocates nor blocks.
+     */
+    wake(self)
+        if self.flag.set.swap(1) == 0
+            self.bell.rung.store(1)
+            self.bell.ring()
+end Waker
+
+/** Raises a source of one loop from any thread, and ends that loop's wait so it sees it at once. It
+ * is a value: copy it to as many threads as raise the source. The loop has to outlive it, as for a
+ * `Waker`.
+ */
+struct Remote
+    private source: u32
+    private bell: &sync Bell
+
+    /** Raise the source on its loop -- that loop only -- and end the loop's wait. */
+    raise(self)
+        self.bell.raised.or(1 << self.source)
+        self.bell.ring()
+
+    /** The source this raises. */
+    number(self) -> u32 = self.source
+end Remote
+
+/** A wake another thread sends one loop: the cross-thread mailbox's doorbell. `lp.notifier()` makes
+ * one; `waker()` answers the value a thread wakes it with; a task takes the wakes with `next`.
+ *
+ * **Wakes coalesce.** Any number of wakes before a `next` takes them are one, so the task's job is to
+ * go and look at whatever the other threads left behind, not to count. A wake while no task waits is
+ * kept, and the next `next` ends at once.
+ *
+ * **It keeps the loop alive only while a task waits in `next`**, and not even then once it is put in
+ * the `background`: a task waiting on a background notifier is left parked, neither waited for nor
+ * cancelled, when nothing else is left. `keep` undoes it, and either may be called while a task
+ * waits.
+ *
+ * One task waits at a time.
+ */
+struct Notifier
+    private flag: &sync Flag
+    private bell: &sync Bell
+    private keeps: &Keeps
+    private waiter: Option[&Fn() -> unit]
+    private woken: bool
+    private waiting: bool
+    private quiet: bool
+
+    /** The value a thread wakes this notifier with. */
+    waker(self) -> Waker = Waker(self.flag, self.bell)
+
+    /** A task that ends at the next wake, or at once if one came since the last `next` ended. */
+    next(&self) -> Task[unit] = notified(self)
+
+    /** Stop counting a task waiting here as something that keeps the loop alive. */
+    background(*self)
+        if self.quiet then return
+
+        self.quiet = true
+        if self.waiting
+            self.keeps.held -= 1
+            self.keeps.quiet += 1
+    end background
+
+    /** Count a waiting task again, as a notifier does when it is made. */
+    keep(*self)
+        if !self.quiet then return
+
+        self.quiet = false
+        if self.waiting
+            self.keeps.quiet -= 1
+            self.keeps.held += 1
+    end keep
+
+    /** Whether it is in the background. */
+    is_background(self) -> bool = self.quiet
+
+    // The loop found the flag set.
+    private[kairos] take(*self)
+        self.woken = true
+
+        self.waiter match
+            Some(w) ->
+                self.waiter = None
+                w()
+            None -> ()
+    end take
+
+    private[kairos] arm(*self, w: &Fn() -> unit)
+        if self.woken then w() else self.waiter = Some(w)
+
+    private[kairos] begin_wait(*self)
+        if self.waiting then panic("a notifier is waited on by one task at a time")
+
+        self.waiting = true
+        if self.quiet then self.keeps.quiet += 1 else self.keeps.held += 1
+
+    private[kairos] end_wait(*self)
+        self.waiting = false
+        self.waiter = None
+        if self.quiet then self.keeps.quiet -= 1 else self.keeps.held -= 1
+
+    private[kairos] consume(*self)
+        self.woken = false
+
+    private[kairos] has_wake(self) -> bool = self.woken
+
+    // The loop's side of the wake: take the flag, and answer whether it was set.
+    private[kairos] taken(self) -> bool = self.flag.set.swap(0) != 0
+end Notifier
 
 /** Why `Loop.on` refused a source. */
 enum SourceError
@@ -158,7 +312,8 @@ struct Job
 /** Why `block_on` came back without its task's result. */
 enum RunError
     /** Nothing left in the loop could ever wake the task -- no timer, source or handle -- so it was
-     * cancelled, with every other task in the same state; `parked` counts them all.
+     * cancelled, with every other task in the same state; `parked` counts them all. Where a task
+     * waits in the background, the others are left parked instead, as `run` leaves them.
      */
     Stalled(parked: usize)
 
@@ -245,6 +400,9 @@ struct Loop[D: Driver]
     private stepping: Buf[Job]
     private time: Duration
     private stopping: bool
+    private bell: Option[&sync Bell]
+    private notifiers: Buf[weak Notifier]
+    private keeps: &Keeps
 
     /** The time this pass started, as the driver read it. */
     now(self) -> Duration = self.time
@@ -305,16 +463,35 @@ struct Loop[D: Driver]
     remove(*self, h: Handle) -> bool =
         if h.idle then self.idles.remove(h.slot, h.gen) else self.checks.remove(h.slot, h.gen)
 
+    /** A notifier of this loop's own, which any thread wakes through its `waker()`. */
+    notifier(*self) -> &Notifier
+        val f: &sync Flag = Flag(Atomic(0))
+        val n: &Notifier = Notifier(f, self.bell_of(), self.keeps, None, false, false, false)
+
+        self.notifiers.push(n)
+        n
+    end notifier
+
+    /** A handle another thread raises source `n` of this loop through -- this loop's, not the
+     * process's -- ending the loop's wait at once. `OutOfRange` for a number `on` would refuse.
+     */
+    remote(*self, n: u32) -> Result[Remote, SourceError]
+        if n >= max_sources then return Err(OutOfRange(n))
+
+        Ok(Remote(n, self.bell_of()))
+
     /** Make `run` return at the end of the current pass. */
     stop(*self)
         self.stopping = true
 
-    /** Whether anything is left that could ever run: a timer, a handle, a source, a woken task, or
+    /** Whether anything is left that could ever run: a timer, a handle, a source registered or
+     * raised, a notifier woken, a woken task, a task waiting on a notifier not in the background, or
      * work the driver holds.
      */
     alive(self) -> bool
-        if self.registered != 0 || self.timers.live > 0 then return true
+        if self.registered != 0 || self.timers.live > 0 || self.keeps.held > 0 then return true
         if self.idles.live > 0 || self.checks.live > 0 || !self.ready.woken.is_empty() then return true
+        if self.raised() then return true
 
         self.driver.busy()
 
@@ -337,7 +514,9 @@ struct Loop[D: Driver]
     abort(*self, j: Job) -> bool = self.tasks.remove(j.slot, j.gen)
 
     /** Run passes until `stop` is called or nothing is left. A task still parked when nothing is left
-     * that could wake it is cancelled.
+     * that could wake it is cancelled -- unless a task waits in the background, on a notifier or on
+     * the driver, since that wait may yet end: then every parked task is left parked, for a later
+     * `run` or `pass`.
      */
     run(*self)
         self.drive(() -> false)
@@ -353,10 +532,11 @@ struct Loop[D: Driver]
         out.value match
             Some(v) -> Ok(v)
             None ->
-                if parked > 0 then return Err(Stalled(parked))
-
+                // Already cancelled where nothing waits in the background; dropped here where
+                // something does, and the rest stay parked.
                 self.abort(j)
-                Err(Stopped)
+
+                if parked > 0 then Err(Stalled(parked)) else Err(Stopped)
     end block_on
 
     /** A task that ends `d` after the pass that first steps it. Dropped early, it cancels its timer. */
@@ -419,7 +599,7 @@ struct Loop[D: Driver]
      * on `backend_fd` -- or a `spawn` or `signal` from the embedder itself -- gives the loop work.
      */
     timeout(*self) -> Option[Duration]
-        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled() then return Some(micros(0))
+        if self.idles.live > 0 || !self.ready.woken.is_empty() || self.raised() then return Some(micros(0))
 
         val mine = self.next_deadline() match
             Some(d) ->
@@ -438,8 +618,9 @@ struct Loop[D: Driver]
      */
     backend_fd(*self) -> Option[int] = self.driver.backend_fd()
 
-    // Passes until `done` says so, `stop` is called, or nothing is left; answers how many parked
-    // tasks were cancelled because nothing was left that could wake them.
+    // Passes until `done` says so, `stop` is called, or nothing is left; answers how many tasks were
+    // left parked because nothing was left that could wake them -- cancelled, unless a background
+    // wait may yet wake one.
     private drive(*self, done: &Fn() -> bool) -> usize
         self.stopping = false
 
@@ -452,7 +633,10 @@ struct Loop[D: Driver]
 
         self.stopping = false
 
-        if self.alive() || done() then 0 else self.cancel_parked()
+        if self.alive() || done() then return 0
+        if self.keeps.quiet > 0 || self.driver.quiet() then return self.tasks.live
+
+        self.cancel_parked()
     end drive
 
     // The body of a pass, from reading the clock to the check handles.
@@ -552,8 +736,15 @@ struct Loop[D: Driver]
                 None -> ()
     end run_handles
 
+    // The sources raised by an interrupt or a remote, then the notifiers woken from other threads.
     private drain(*self)
-        val raised = pending.swap(0)
+        var raised = pending.swap(0)
+
+        self.bell match
+            Some(b) ->
+                raised |= b.raised.swap(0)
+                if b.rung.swap(0) != 0 then self.take_wakes()
+            None -> ()
 
         for n in 0..<max_sources
             if (raised & (1 << n)) != 0
@@ -562,9 +753,41 @@ struct Loop[D: Driver]
                     None -> ()
     end drain
 
+    // Hand each woken notifier its wake, and forget the ones nothing holds any more.
+    private take_wakes(*self)
+        var i: usize = 0
+
+        while i < self.notifiers.len()
+            self.notifiers[i].get() match
+                Some(n) ->
+                    if n.taken() then n.take()
+                    i += 1
+                None -> self.notifiers.remove(i)
+    end take_wakes
+
+    // Whether a source is raised, by an interrupt or a remote, or a notifier woken, and not yet
+    // drained.
+    private raised(self) -> bool
+        if signalled() then return true
+
+        self.bell match
+            Some(b) -> b.raised.load() != 0 || b.rung.load() != 0
+            None -> false
+
+    // The bell other threads ring this loop with, made the first time one is asked for.
+    private bell_of(*self) -> &sync Bell
+        self.bell match
+            Some(b) -> b
+            None ->
+                val b: &sync Bell = Bell(Atomic(0), Atomic(0), self.driver.waker())
+
+                self.bell = Some(b)
+                b
+    end bell_of
+
     // Wait for the nearest timer or the next event, but no later than `cap` where there is one.
     private wait(*self, cap: Option[Duration])
-        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled()
+        if self.idles.live > 0 || !self.ready.woken.is_empty() || self.raised()
             self.driver.poll()
             return
 
@@ -584,4 +807,4 @@ end Loop
  */
 event_loop[D: Driver](driver: &D) -> &Loop[D] =
     Loop(driver, [None; 32], 0, slots(), heap(), 0, slots(), slots(), slots(), Ready(buf()), buf(),
-        driver.now(), false)
+        driver.now(), false, None, buf(), Keeps(0, 0))
