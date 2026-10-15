@@ -245,17 +245,19 @@ lp.run()
 | | |
 |---|---|
 | `io.connect(addr)` | a task ending with a `&Connection`, or `ECONNREFUSED` |
-| `io.listen(addr)` | a `&Listener` at once; `l.accept()` is a task, `l.port()` the port the kernel chose |
-| `conn.read()`, `conn.write(bytes)` | tasks; a dropped read consumes nothing, so `lp.timeout(d, conn.read())` loses no bytes |
-| `conn.shutdown()` | a task; closes this side's half once queued writes have gone, so the peer reads the end while it can still answer |
+| `io.listen(addr, backlog, reuse_port, ipv6_only)` | a `&Listener` at once; `l.accept()` is a task, `l.port()` the port the kernel chose. `reuse_port = true` shares the port across listeners (`ENOTSUP` where the kernel does not distribute, macOS included); `ipv6_only = true` keeps v4 clients off a v6 address |
+| `conn.read()`, `conn.write(bytes)` | tasks; a dropped read consumes nothing, so `lp.timeout(d, conn.read())` loses no bytes. **A write is issued at the call**, in call order, and its task only reports how it ended, so `conn.write(a); conn.write(b); conn.close()` sends both |
+| `conn.shutdown()` | issued at the call; closes this side's half once queued writes have gone, so the peer reads the end while it can still answer |
 | `conn.nodelay(on)` | Nagle's algorithm off (`true`) or on |
+| `conn.peer()`, `conn.local()` | the address of the other end, and of this one |
+| `ByteStream` | the trait `Connection` and `Pipe` share -- `read`, `write`, `shutdown`, `close` -- so a protocol over a stream (TLS, a framing) is written once as `async f[S: ByteStream](s: &S)` |
 | `io.read_file(path)`, `io.write_file(path, bytes)` | whole files, on libuv's thread pool |
 | `io.resolve(host, service)` | a name lookup, on the thread pool |
 | `io.open(path, flags, mode)` | a task ending with a `&File`; `f.read(n)`, `f.read_at(n, offset)`, `f.write(bytes)`, `f.write_at(bytes, offset)` and `f.close()` are tasks, and a `File` dropped open is closed |
 | `io.stat`, `io.scandir`, `io.mkdir`, `io.rmdir`, `io.unlink`, `io.rename`, `io.chmod` | the file system, each a task on the thread pool |
 | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.adopt(fd)` | a `&Pipe` over a descriptor this process already has: a terminal, a pipe or a socket |
 | `io.socket_pair()` | two connected `&Pipe`s |
-| `p.read()`, `p.write(bytes)`, `p.shutdown()` | tasks on a `Pipe`, as on a `Connection`; `p.is_terminal()` says which it is |
+| `p.read()`, `p.write(bytes)`, `p.shutdown()` | `ByteStream`'s, on a `Pipe` as on a `Connection`; `p.is_terminal()` says which it is |
 | `io.spawn(file, args, env, cwd, stdin, stdout, stderr)` | a `&Process`; each stream is `Inherit`, `Piped` or `Ignore`, and a `Piped` one is `proc.stdin()`, `proc.stdout()` or `proc.stderr()` |
 | `proc.exit()`, `proc.kill(signum)`, `proc.pid()` | a task ending with how the child ended (`Exit`'s `status` or `signal`); `kill` after it has exited is `ESRCH`, never a signal to a process that has taken over its id |
 | `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival |

@@ -1,0 +1,328 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// Streams as a protocol sees them: writes and shutdowns go out at the call and in order, one piece of
+// generic code runs over a TCP connection and a socket pair alike, and a listener's bind options and a
+// connection's own address are the kernel's.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{ip4, ip6}
+import sh.sysl.kairos.{Loop, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.millis
+import sysl.testing.skip
+
+private loopback(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+private said(bytes: []const u8) -> string = from_utf8_lossy(bytes)
+
+private connected(io: &Uv, lp: &Loop[Uv], l: &Listener) -> (&Connection, &Connection)
+    val client = lp.block_on(io.connect(loopback(l.port().expect("a port")))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+
+    (client, server)
+
+// Everything one stream has to say until its end, over any kind of stream.
+private async read_all[S: ByteStream](s: &S) -> Result[[]u8, Error]
+    var out: Buf[u8] = buf()
+
+    loop
+        val got = (await s.read())?
+
+        if got.len == 0 then break
+
+        out.extend(got)
+
+    Ok(out.view())
+
+// One side of a conversation, written once: say `message`, close the writing half, and hear the rest.
+private async converse[S: ByteStream](s: &S, message: string) -> Result[string, Error]
+    (await s.write(message.bytes))?
+    (await s.shutdown())?
+
+    Ok(said((await read_all(s))?))
+
+// The other side: hand back everything heard, upper-cased, then close.
+private async shout_back[S: ByteStream](s: &S)
+    val heard = (await read_all(s)).expect("heard")
+    var loud: Buf[u8] = buf()
+
+    for b in heard
+        loud.push(if b >= u8('a') && b <= u8('z') then b - 32 else b)
+
+    (await s.write(loud.view())).expect("answered")
+    s.close()
+
+private async close_soon[S: ByteStream](lp: &Loop[Uv], s: &S)
+    await lp.sleep(millis(1))
+    s.close()
+
+// -- Writes start at the call --------------------------------------------------------------------
+
+@test("write, write, close in one turn delivers both writes, in order, with neither task awaited")
+writes_before_a_close_arrive()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val (client, server) = connected(io, lp, l)
+
+    client.write("first,".bytes)
+    client.write("second".bytes)
+    client.close()
+
+    assert_eq(said(lp.block_on(read_all(server)).expect("ran").expect("read")), "first,second")
+
+    server.close()
+    l.close()
+    lp.run()
+    assert(!io.on_loop().alive(), "everything closed")
+end writes_before_a_close_arrive
+
+@test("a write's task, awaited after the close, reports the write the kernel took")
+write_awaited_after_close()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val (client, server) = connected(io, lp, l)
+    val w = client.write("taken".bytes)
+
+    client.close()
+
+    lp.block_on(w).expect("ran").expect("the kernel had it before the close")
+    assert_eq(said(lp.block_on(read_all(server)).expect("ran").expect("read")), "taken")
+
+    server.close()
+    l.close()
+    lp.run()
+
+@test("writes awaited in the reverse order still go out in the order they were issued")
+writes_keep_their_order()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+    val one = a.write("1".bytes)
+    val two = a.write("2".bytes)
+    val three = a.write("3".bytes)
+    val last = a.shutdown()
+
+    lp.block_on(last).expect("ran").expect("half-closed")
+    lp.block_on(three).expect("ran").expect("written")
+    lp.block_on(two).expect("ran").expect("written")
+    lp.block_on(one).expect("ran").expect("written")
+
+    assert_eq(said(lp.block_on(read_all(b)).expect("ran").expect("read")), "123")
+
+    a.close()
+    b.close()
+    lp.run()
+
+@test("a shutdown issued unawaited after a write ends the stream after it")
+shutdown_at_the_call()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+
+    a.write("all of it".bytes)
+    a.shutdown()
+
+    assert_eq(said(lp.block_on(read_all(b)).expect("ran").expect("read")), "all of it")
+
+    a.close()
+    b.close()
+    lp.run()
+
+@test("a write or a shutdown on a closed stream answers with the refusal, and does not hang")
+write_on_closed_stream()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val (client, server) = connected(io, lp, l)
+
+    client.close()
+
+    lp.block_on(client.write("late".bytes)).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.EBADF)
+        Ok(_) -> assert(false, "a write on a closed connection was accepted")
+
+    lp.block_on(client.shutdown()).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ENOTCONN")
+        Ok(_) -> assert(false, "a shutdown on a closed connection was accepted")
+
+    val (a, b) = io.socket_pair().expect("a pair")
+
+    a.close()
+
+    lp.block_on(a.write("late".bytes)).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.EBADF)
+        Ok(_) -> assert(false, "a write on a closed pipe was accepted")
+
+    b.close()
+    server.close()
+    l.close()
+    lp.run()
+end write_on_closed_stream
+
+// -- One protocol over every kind of stream ------------------------------------------------------
+
+@test("one generic conversation runs over a TCP connection")
+byte_stream_over_tcp()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val (client, server) = connected(io, lp, l)
+
+    lp.spawn(shout_back(server))
+
+    assert_eq(lp.block_on(converse(client, "over tcp")).expect("ran").expect("conversed"), "OVER TCP")
+
+    client.close()
+    l.close()
+    lp.run()
+    assert(!io.on_loop().alive(), "everything closed")
+
+@test("the same generic conversation runs over a socket pair")
+byte_stream_over_pipe()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+
+    lp.spawn(shout_back(b))
+
+    assert_eq(lp.block_on(converse(a, "over a pipe")).expect("ran").expect("conversed"), "OVER A PIPE")
+
+    a.close()
+    lp.run()
+    assert(!io.on_loop().alive(), "everything closed")
+
+@test("a generic read on a stream closed under it ends with ECANCELED, on either kind")
+byte_stream_cancelled()
+    val io = uv()
+    val lp = event_loop(io)
+    val (a, b) = io.socket_pair().expect("a pair")
+    val l = io.listen(loopback(0)).expect("listening")
+    val (client, server) = connected(io, lp, l)
+
+    lp.spawn(close_soon(lp, a))
+    lp.spawn(close_soon(lp, client))
+
+    lp.block_on(read_all(a)).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ECANCELED)
+        Ok(_) -> assert(false, "a read on a closed pipe answered")
+
+    lp.block_on(read_all(client)).expect("ran") match
+        Err(e) -> assert_eq(e.code, libuv.ECANCELED)
+        Ok(_) -> assert(false, "a read on a closed connection answered")
+
+    b.close()
+    server.close()
+    l.close()
+    lp.run()
+end byte_stream_cancelled
+
+// -- Bind options and the local address ----------------------------------------------------------
+
+@test("local() is the bound port on the accepting side, and the peer's view of the client")
+local_address()
+    val io = uv()
+    val lp = event_loop(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val (client, server) = connected(io, lp, l)
+    val here = server.local().expect("a local address")
+
+    assert_eq(here.port(), port)
+    assert_eq(here.ip(), "127.0.0.1")
+    assert_eq(client.local().expect("a local address"), server.peer().expect("a peer"))
+    assert_eq(server.local().expect("a local address"), client.peer().expect("a peer"))
+    assert(client.local().expect("a local address").port() != port, "the client has a port of its own")
+
+    client.close()
+
+    client.local() match
+        Err(e) -> assert_eq(e.code, libuv.EBADF)
+        Ok(_) -> assert(false, "a closed connection still had an address")
+
+    server.close()
+    l.close()
+    lp.run()
+end local_address
+
+@test("reuse_port lets two listeners share one port, or is refused with ENOTSUP where the kernel will not")
+listen_reuse_port()
+    val io = uv()
+    val lp = event_loop(io)
+
+    io.listen(loopback(0), reuse_port = true) match
+        Err(e) ->
+            // macOS among others: libuv refuses the flag rather than bind a socket that would not be
+            // load balanced. Nothing more can be checked on such a kernel.
+            assert_eq(e.code, libuv.ENOTSUP)
+            skip("this kernel does not distribute connections over SO_REUSEPORT (libuv: ENOTSUP)")
+        Ok(first) ->
+            val port = first.port().expect("a port")
+            val second = io.listen(loopback(port), reuse_port = true).expect("the port is shared")
+
+            assert_eq(second.port().expect("a port"), port)
+
+            io.listen(loopback(port)) match
+                Err(e) -> assert_eq(e.name(), "EADDRINUSE")
+                Ok(_) -> assert(false, "a listener without reuse_port joined a shared port")
+
+            first.close()
+            second.close()
+
+    lp.run()
+    assert(!io.on_loop().alive(), "everything closed")
+end listen_reuse_port
+
+@test("without reuse_port a second listener on a held port is EADDRINUSE")
+listen_without_reuse_port()
+    val io = uv()
+    val lp = event_loop(io)
+    val first = io.listen(loopback(0)).expect("listening")
+
+    io.listen(loopback(first.port().expect("a port"))) match
+        Err(e) -> assert_eq(e.name(), "EADDRINUSE")
+        Ok(_) -> assert(false, "two listeners held one port")
+
+    first.close()
+    lp.run()
+
+@test("ipv6_only keeps v4 clients out of a v6 listener, which takes them without it")
+listen_ipv6_only()
+    val io = uv()
+    val lp = event_loop(io)
+    val dual = io.listen(ip6("::", 0).expect("an address")).expect("listening")
+    val dual_port = dual.port().expect("a port")
+    val c = lp.block_on(io.connect(loopback(dual_port))).expect("ran").expect("a v4 client reached [::]")
+
+    lp.block_on(dual.accept()).expect("ran").expect("accepted").close()
+    c.close()
+    dual.close()
+
+    val only = io.listen(ip6("::", 0).expect("an address"), ipv6_only = true).expect("listening")
+    val only_port = only.port().expect("a port")
+
+    lp.block_on(io.connect(loopback(only_port))).expect("ran") match
+        Err(e) -> assert_eq(e.name(), "ECONNREFUSED")
+        Ok(_) -> assert(false, "a v4 client reached a v6-only listener")
+
+    lp.block_on(io.connect(ip6("::1", only_port).expect("an address"))).expect("ran").expect("a v6 client").close()
+
+    only.close()
+    lp.run()
+end listen_ipv6_only
+
+@test("ipv6_only with a v4 address is EINVAL")
+ipv6_only_on_v4()
+    val io = uv()
+
+    io.listen(loopback(0), ipv6_only = true) match
+        Err(e) -> assert_eq(e.name(), "EINVAL")
+        Ok(_) -> assert(false, "a v4 address was bound v6-only")
+
+    event_loop(io).run()
+#endif

@@ -20,6 +20,45 @@ import sh.sysl.libuv
 import sh.sysl.libuv.{Handle, Stream}
 import sysl.slices.copy
 
+/** What every byte stream here answers: a TCP `Connection`, and a `Pipe` -- a pipe, a Unix-domain
+ * socket or a terminal. Code written over it runs on any of them, which is how a protocol layered on
+ * a stream -- TLS, a framing, an echo -- is written once:
+ *
+ *     async echo[S: ByteStream](s: &S) -> Result[unit, Error]
+ *         loop
+ *             val got = (await s.read())?
+ *             if got.len == 0 then break
+ *             (await s.write(got))?
+ *         (await s.shutdown())?
+ *         Ok(())
+ *
+ * A write and a shutdown are issued when they are called, in the order they are called; the task
+ * each answers only says how it ended.
+ */
+trait ByteStream
+    /** A task that ends with the next bytes that arrived -- at most 64 KiB -- or with an empty slice
+     * once the other end has closed its writing half. Dropping it before it ends consumes nothing.
+     */
+    read(self) -> Task[Result[[]u8, Error]]
+
+    /** Queue `bytes` now, behind every write and shutdown issued before; the task ends when they have
+     * been handed to the kernel. The bytes are copied, so the caller's slice need not outlive the
+     * call, and dropping the task does not take the write back.
+     */
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]]
+
+    /** Close the writing half now, once every write queued before it has gone; the task ends when it
+     * has. The other end reads the end of the stream, and may still answer.
+     */
+    shutdown(self) -> Task[Result[unit, Error]]
+
+    /** Close the stream and the descriptor under it. A task still reading ends with `ECANCELED`, and
+     * so does a write libuv still held -- one the kernel had not yet taken. Closing again does
+     * nothing.
+     */
+    close(self)
+end ByteStream
+
 /** The read a stream has in flight, if any: where `close` finds the task to end with `ECANCELED`. */
 private[uv] struct Reader
     reading: Option[&Pending[Result[[]u8, Error]]]
@@ -48,25 +87,31 @@ private stop_reading[S: Stream](s: &S, r: &Reader)
     r.reading = None
     if !s.is_closing() then s.read_stop()
 
-private[uv] async write_stream[S: Stream](s: &S, bytes: []const u8) -> Result[unit, Error]
+// **A write and a shutdown are issued at the call, and the task only reports how they ended.** libuv
+// queues them in the order they were issued, so `write(a)`, `write(b)`, `shutdown()` from one turn go
+// out as `a`, `b`, then the end of the stream, whether or not -- and in whatever order -- their tasks
+// are awaited, and a task dropped unawaited still has its bytes sent. A refusal at the call (the
+// handle is closed) is the task's answer, not lost.
+private[uv] write_stream[S: Stream](s: &S, bytes: []const u8) -> Task[Result[unit, Error]]
     val p: &Pending[Result[unit, Error]] = pending()
 
-    s.write(bytes, (r) -> p.finish(r))?
+    s.write(bytes, (r) -> p.finish(r)) match
+        Err(e) -> p.finish(Err(e))
+        Ok(_) -> ()
 
-    val r = await settled(p)
+    completion(p)
 
-    r?
-    Ok(())
-
-private[uv] async shutdown_stream[S: Stream](s: &S) -> Result[unit, Error]
+private[uv] shutdown_stream[S: Stream](s: &S) -> Task[Result[unit, Error]]
     val p: &Pending[Result[unit, Error]] = pending()
 
-    s.shutdown((r) -> p.finish(r))?
+    s.shutdown((r) -> p.finish(r)) match
+        Err(e) -> p.finish(Err(e))
+        Ok(_) -> ()
 
-    val r = await settled(p)
+    completion(p)
 
-    r?
-    Ok(())
+private async completion(p: &Pending[Result[unit, Error]]) -> Result[unit, Error]
+    await settled(p)
 
 // Every stream here closes through this, so closing twice -- or closing and then dropping -- is safe,
 // and a task still reading ends with `ECANCELED` rather than waiting on a handle that is gone.
@@ -103,35 +148,27 @@ struct Pipe
     private end: End
     private reads: &Reader
 
-    /** A task that ends with the next bytes that arrived -- at most 64 KiB -- or with an empty slice
-     * once the other end has closed. Dropping it before it ends consumes nothing.
-     */
-    read(self) -> Task[Result[[]u8, Error]] = self.end match
-        Piped(p) -> read_stream(p, self.reads)
-        Terminal(t) -> read_stream(t, self.reads)
-
-    /** A task that ends when `bytes` have been handed to the kernel. The bytes are copied at the
-     * start, so the caller's slice need not outlive it.
-     */
-    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = self.end match
-        Piped(p) -> write_stream(p, bytes)
-        Terminal(t) -> write_stream(t, bytes)
-
-    /** A task that ends when this end's writing half is closed, once every write queued before it has
-     * gone: the other end reads the end of the stream, and may still answer.
-     */
-    shutdown(self) -> Task[Result[unit, Error]] = self.end match
-        Piped(p) -> shutdown_stream(p)
-        Terminal(t) -> shutdown_stream(t)
-
     /** Whether this is a terminal, which is how `stdin` was opened when it is one. */
     is_terminal(self) -> bool = self.end match
         Piped(_) -> false
         Terminal(_) -> true
+end Pipe
 
-    /** Close it, and the descriptor under it. A task still reading ends with `ECANCELED`. Closing
-     * again does nothing.
-     */
+// Reading, writing, the half-close and the close are `ByteStream`'s, so code over the trait takes a
+// pipe as readily as a connection.
+impl ByteStream for Pipe
+    read(self) -> Task[Result[[]u8, Error]] = self.end match
+        Piped(p) -> read_stream(p, self.reads)
+        Terminal(t) -> read_stream(t, self.reads)
+
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = self.end match
+        Piped(p) -> write_stream(p, bytes)
+        Terminal(t) -> write_stream(t, bytes)
+
+    shutdown(self) -> Task[Result[unit, Error]] = self.end match
+        Piped(p) -> shutdown_stream(p)
+        Terminal(t) -> shutdown_stream(t)
+
     close(self) = self.end match
         Piped(p) -> close_stream(p, self.reads)
         Terminal(t) -> close_stream(t, self.reads)

@@ -50,9 +50,24 @@ struct Uv
      */
     connect(self, addr: libuv.Address) -> Task[Result[&Connection, Error]] = connect_on(self.lp, addr)
 
-    /** Bind `addr` and start listening. A port of `0` lets the kernel choose; `port()` says which. */
-    listen(self, addr: libuv.Address, backlog: int = 128) -> Result[&Listener, Error] =
-        listen_on(self.lp, addr, backlog)
+    /** Bind `addr` and start listening. A port of `0` lets the kernel choose; `port()` says which.
+     *
+     * Two options, named at the call: `reuse_port` lets several listeners hold one port and has the
+     * kernel share connections across them (`SO_REUSEPORT` with load balancing) -- **refused with
+     * `ENOTSUP` where the kernel does not distribute, macOS included**, so a server that wants the
+     * port either way listens again without it; `ipv6_only` binds a v6 address alone, so a v4 client
+     * is not taken through the v4-mapped addresses, and is `EINVAL` with a v4 address.
+     *
+     *     val l = io.listen(ip4("0.0.0.0", 8080)?, reuse_port = true)?
+     */
+    listen(self, addr: libuv.Address, backlog: int = 128, reuse_port: bool = false,
+           ipv6_only: bool = false) -> Result[&Listener, Error]
+        var flags: u32 = 0
+
+        if reuse_port then flags |= libuv.TCP_REUSEPORT
+        if ipv6_only then flags |= libuv.TCP_IPV6ONLY
+
+        listen_on(self.lp, addr, backlog, flags)
 
     /** A task that reads the whole of the file at `path`. */
     read_file(self, path: string) -> Task[Result[[]u8, Error]] = read_file_on(self.lp, path)
