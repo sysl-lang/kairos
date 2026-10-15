@@ -1,0 +1,304 @@
+module sh.sysl.kairos.sim
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, millis, whole_micros}
+import sh.sysl.kairos.{Loop, event_loop, signal, signalled, NoWait, Once, Until}
+
+/** `Loop.pass` and `Loop.timeout`, on the simulated driver: a loop driven one pass at a time by a
+ * program of its own, which is how a loop is embedded in somebody else's.
+ *
+ * Each test asserts what every pass answered, the log of what ran, and the deadlines the driver was
+ * asked to wait for -- so a pass that waited when it should not have, or ran a task twice, is a
+ * disagreement rather than a count that happens to match.
+ */
+
+private ms(lp: &Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+// The same, for a callback, which is handed the loop it runs on.
+private ms(lp: *Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private waited(s: &Sim) -> Buf[long]
+    var out: Buf[long] = buf()
+
+    for w in s.waits()
+        out.push(w match
+            Some(d) -> whole_micros(d) / 1000
+            None -> -1)
+
+    out
+end waited
+
+private in_ms(d: Option[Duration]) -> long = d match
+    Some(v) -> whole_micros(v) / 1000
+    None -> -1
+
+private async steps(log: &Buf[string], name: string, rounds: int)
+    for i in 0..<rounds
+        log.push(s"$name$i")
+        await yield_now()
+
+private async nap(lp: &Loop[Sim], log: &Buf[string], name: string, d: long)
+    await lp.sleep(millis(d))
+    log.push(s"$name@${ms(lp)}")
+
+private struct Waker
+    w: Option[&Fn() -> unit]
+
+private async held(log: &Buf[string], k: &Waker)
+    defer log.push("held closed")
+    await park((w) -> k.w = Some(w))
+    log.push("held resumed")
+
+// ---- pass ---------------------------------------------------------------------------------------
+
+@test("pass(NoWait) steps each woken task once a pass, never waits, and answers false once drained")
+no_wait_drains()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(steps(log, "a", 2))
+    lp.spawn(steps(log, "b", 1))
+
+    var answers: Buf[bool] = buf()
+    loop
+        val more = lp.pass(NoWait)
+        answers.push(more)
+        if !more then break
+
+    assert_eq(answers.view(), [true, true, false])
+    assert_eq(log.view(), ["a0", "b0", "a1"])
+    assert_eq(waited(s).len(), 0)
+    assert_eq(lp.running(), 0)
+end no_wait_drains
+
+@test("pass(NoWait) on a sleeping task neither waits nor moves the clock, and keeps answering true")
+no_wait_does_not_wait_for_a_timer()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 10))
+
+    for _ in 0..<5
+        assert(lp.pass(NoWait), "a timer is still set")
+
+    assert(log.is_empty(), "the timer cannot fire while the clock stands still")
+    assert_eq(ms(lp), 0)
+    assert_eq(waited(s).len(), 0)
+
+    s.advance(millis(10))
+    assert(!lp.pass(NoWait), "the timer fired and its task ended in that pass")
+    assert_eq(log.view(), ["a@10"])
+end no_wait_does_not_wait_for_a_timer
+
+@test("pass(Once) waits for the nearest timer and runs its task in the same pass")
+once_waits_and_handles()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 10))
+    lp.spawn(nap(lp, log, "b", 4))
+
+    assert(lp.pass(Once), "the first pass only starts the tasks")
+    assert_eq(waited(s).len(), 0)
+    assert(lp.pass(Once), "a is still sleeping")
+    assert_eq(log.view(), ["b@4"])
+    assert(!lp.pass(Once), "nothing is left")
+    assert_eq(log.view(), ["b@4", "a@10"])
+    assert_eq(waited(s).view(), [4, 10])
+end once_waits_and_handles
+
+@test("pass(Until(d)) waits no longer than d, and no longer than the nearest timer")
+until_is_capped()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 50))
+
+    assert(lp.pass(Until(millis(20))), "the first pass starts the task without waiting")
+    assert(lp.pass(Until(millis(20))), "a capped wait ends before the timer")
+    assert(log.is_empty())
+    assert_eq(ms(lp), 20)
+    assert(!lp.pass(Until(millis(100))), "the timer is nearer than the cap")
+    assert_eq(log.view(), ["a@50"])
+    assert_eq(waited(s).view(), [20, 50])
+end until_is_capped
+
+@test("pass(Until(0)) waits for nothing")
+until_zero_does_not_wait()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 5))
+    lp.pass(Once)
+
+    assert(lp.pass(Until(millis(0))), "the timer is still set")
+    assert_eq(ms(lp), 0)
+    assert_eq(waited(s).len(), 0)
+end until_zero_does_not_wait
+
+@test("pass on a loop with nothing in it answers false at once, in every mode, without waiting")
+an_empty_pass_does_not_wait()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+
+    assert(!lp.pass(NoWait))
+    assert(!lp.pass(Once))
+    assert(!lp.pass(Until(millis(10))))
+    assert_eq(waited(s).len(), 0)
+    assert_eq(ms(lp), 0)
+
+@test("a task parked on nothing survives an empty pass, and runs when the embedder wakes it")
+a_parked_task_survives_a_pass()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+    val k: &Waker = Waker(None)
+
+    lp.spawn(held(log, k))
+
+    assert(!lp.pass(Once), "nothing is left that the loop itself could wake it with")
+    assert(!lp.pass(Once), "and a second empty pass does not wait for it either")
+    assert_eq(lp.running(), 1)
+    assert(log.is_empty(), "the task was neither cancelled nor resumed")
+    assert_eq(waited(s).len(), 0)
+
+    k.w.expect("the task parked with a waker")()
+    assert(!lp.pass(NoWait), "the woken task ran to its end")
+    assert_eq(log.view(), ["held resumed", "held closed"])
+    assert_eq(lp.running(), 0)
+end a_parked_task_survives_a_pass
+
+@test("run still cancels what pass leaves parked")
+run_cancels_what_pass_left()
+    assert(!signalled())
+    val lp = event_loop(sim())
+    val log: &Buf[string] = buf()
+
+    val k: &Waker = Waker(None)
+
+    lp.spawn(held(log, k))
+    assert(!lp.pass(NoWait))
+    assert_eq(lp.running(), 1)
+
+    lp.run()
+    assert_eq(log.view(), ["held closed"])
+    assert_eq(lp.running(), 0)
+
+@test("a serve loop over pass(Once) handles a timer, a source and tasks in order, and ends when drained")
+serve_loop_over_pass()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.on(3, (l) ->
+        log.push(s"irq@${ms(l)}")
+        l.off(3)).expect("source 3 is free")
+    s.irq_at(millis(7), 3)
+    lp.spawn(nap(lp, log, "a", 5))
+    lp.spawn(nap(lp, log, "b", 12))
+    lp.after(millis(9), (l) -> log.push(s"timer@${ms(l)}"))
+
+    var passes = 0
+    while lp.pass(Once)
+        passes += 1
+
+    assert_eq(log.view(), ["a@5", "irq@7", "timer@9", "b@12"])
+    assert_eq(waited(s).view(), [5, 9, 9, 12])
+    assert_eq(passes, 4)
+    assert(!signalled())
+end serve_loop_over_pass
+
+@test("a stop during a pass makes it answer false, once: the next pass carries on")
+stop_ends_a_serve_loop()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.every(millis(10), (l) ->
+        log.push(s"tick@${ms(l)}")
+        if log.len() == 3 then l.stop())
+
+    while lp.pass(Once)
+        ()
+
+    assert_eq(log.view(), ["tick@10", "tick@20", "tick@30"])
+    assert(lp.pass(Once), "the stop was taken back, and the timer is still set")
+    assert_eq(log.view(), ["tick@10", "tick@20", "tick@30", "tick@40"])
+end stop_ends_a_serve_loop
+
+// ---- timeout ------------------------------------------------------------------------------------
+
+@test("timeout is None on an empty loop, and backend_fd is None on a driver with no descriptor")
+timeout_idle()
+    assert(!signalled())
+    val lp = event_loop(sim())
+
+    assert(lp.timeout().is_none())
+    assert(lp.backend_fd().is_none())
+
+@test("timeout is zero while a task is woken, and the distance to the nearest timer once it sleeps")
+timeout_follows_tasks_and_timers()
+    assert(!signalled())
+    val s = sim()
+    val lp = event_loop(s)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(nap(lp, log, "a", 30))
+    assert_eq(in_ms(lp.timeout()), 0)
+
+    lp.pass(NoWait)
+    assert_eq(in_ms(lp.timeout()), 30)
+
+    val t = lp.after(millis(12), (l) -> ())
+    assert_eq(in_ms(lp.timeout()), 12)
+
+    s.advance(millis(5))
+    assert_eq(in_ms(lp.timeout()), 7, "measured from the driver's clock, not the pass's")
+
+    lp.cancel(t)
+    assert_eq(in_ms(lp.timeout()), 25, "a cancelled timer is not counted")
+
+    s.advance(millis(40))
+    assert_eq(in_ms(lp.timeout()), 0, "a timer already due is zero, never negative")
+
+    assert(!lp.pass(NoWait))
+    assert_eq(log.view(), ["a@45"])
+    assert(lp.timeout().is_none())
+end timeout_follows_tasks_and_timers
+
+@test("timeout is zero while an idle handle exists or a source is raised, and None again after")
+timeout_idle_and_sources()
+    assert(!signalled())
+    val lp = event_loop(sim())
+
+    val h = lp.idle((l) -> ())
+    assert_eq(in_ms(lp.timeout()), 0)
+    lp.remove(h)
+    assert(lp.timeout().is_none())
+
+    lp.on(5, (l) -> ()).expect("source 5 is free")
+    assert(lp.timeout().is_none(), "a handler alone sets no limit: only its signal does")
+
+    signal(5)
+    assert_eq(in_ms(lp.timeout()), 0)
+
+    assert(lp.pass(NoWait), "the handler is still registered")
+    assert(!signalled())
+    assert(lp.timeout().is_none())
+    lp.off(5)
+end timeout_idle_and_sources

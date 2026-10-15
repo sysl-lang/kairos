@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.3" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.4" }
 }
 ```
 
@@ -137,6 +137,35 @@ Ok(None)
 - **A task that finishes in the pass its timeout falls due wins.**
 - The loop is a `&Loop[D]` because a task reaches it through the box for as long as it runs.
 
+## Driving the loop yourself, and embedding it
+
+`run` and `block_on` own the program's loop. A program that has a loop already — a GUI toolkit's, a
+language runtime's — drives kairos one pass at a time instead:
+
+| | |
+|---|---|
+| `lp.pass(NoWait)` | take in what the driver has ready, run what is due and woken, return at once |
+| `lp.pass(Once)` | as `NoWait`, but first wait for the next timer, source, task or driver event if nothing is ready |
+| `lp.pass(Until(d))` | as `Once`, waiting no longer than `d` |
+| `lp.timeout()` | how long the embedder may wait: zero if a task is woken, an idle handle exists or a source is raised; else the nearer of the next kairos timer and the driver's own; `None` if neither sets a limit |
+| `lp.backend_fd()` | the descriptor the driver's events make readable — libuv's epoll or kqueue fd on the `uv` driver, `None` elsewhere |
+
+Each `pass` answers whether anything is left that could run, so `while lp.pass(Once)` is a serve
+loop; a `stop` during a pass makes that one answer false. **A pass never cancels**: a task parked on
+nothing stays parked, because the embedder may yet wake it. An embedder waits on `backend_fd` for
+`timeout()` and then calls `pass(NoWait)`:
+
+```sysl
+val fd = lp.backend_fd().expect("a uv driver")
+
+while lp.pass(NoWait)
+    wait_readable(fd, lp.timeout())        // poll(2), or the toolkit's own fd watch
+```
+
+kairos's timers are not libuv's, so libuv's `uv_backend_timeout` cannot see them, nor a task already
+woken; `timeout()` adds both. The `uv` driver answers `None` rather than libuv's zero for a libuv loop
+with nothing alive, which would otherwise spin the embedder.
+
 ## The interrupt contract
 
 `signal` is one atomic OR into a word of module storage:
@@ -164,6 +193,9 @@ trait Driver
 
     busy(*self) -> bool = false
     poll(*self) = ()
+
+    backend_fd(*self) -> Option[int] = None
+    backend_timeout(*self) -> Option[Duration] = None
 ```
 
 The machine is a value chosen in code — `event_loop(host())`, `event_loop(sim())`, a board's — and the
@@ -177,7 +209,9 @@ but an interrupt can land between that check and the sleep.
 
 `busy` and `poll` matter only to a driver that is itself a source of events, which today is the
 libuv one: `busy` keeps the loop alive while the driver holds work a task waits on, and `poll` takes
-in what has already happened, on a pass that does not idle.
+in what has already happened, on a pass that does not idle. `backend_fd` and `backend_timeout` are
+for embedding ([above](#driving-the-loop-yourself-and-embedding-it)): the descriptor an embedder
+waits on, and the longest it may wait before the driver has something of its own to do.
 
 Two ship in the core, and a third behind the `uv` feature ([below](#the-uv-feature-libuv-sockets-and-files)):
 
@@ -214,7 +248,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.3", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.4", features = [uv] }
 }
 ```
 
@@ -359,13 +393,16 @@ SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test . --features uv
 `sysl test .` on its own turns every feature on. The core's tests run on the simulated driver:
 deterministic, no real sleeping, each asserting a whole timeline of what ran and when, and the
 deadlines `idle_until` was handed; one on the host driver checks that two sleeps take at least their
-sum of real time. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
+sum of real time; `pass` and `timeout` are checked the same way, in every mode, with a parked task
+that survives empty passes and a serve loop over `pass(Once)`. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
 refusal (`ECONNREFUSED`, `EADDRINUSE`, `ENOENT`, `EAI_NONAME`, `ECANCELED` on a close), a timeout
 around a read nothing answers, cancellation by drop, and a yielding task that must not starve libuv —
 and on child processes and pipes: exit statuses and signals, `ESRCH` for a child already gone, piped
 standard streams both ways, a socket pair, signals caught by task and by stream, every file-system
 call and a `File` read and written at offsets, a job on the thread pool, and a remote raised from
-another thread.
+another thread. An embedder over `poll(2)` on `backend_fd`, waiting for `timeout()` and driving
+`pass(NoWait)`, runs kairos timers, a TCP echo, a read under a timeout and a child with no timer at
+all, failing on a wait that would have been for ever and on a thousand waits.
 ASan instruments the sysl half only: libuv is a `pkg_config` library someone else compiled.
 
 ## License

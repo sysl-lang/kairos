@@ -188,6 +188,23 @@ impl Driver for Uv
 
     override poll(*self)
         self.lp.run(libuv.RUN_NOWAIT).expect("libuv ran")
+
+    override backend_fd(*self) -> Option[int]
+        val fd = self.lp.backend_fd()
+
+        if fd >= 0 then Some(int(fd)) else None
+
+    // libuv answers 0 for a loop with nothing alive, which would have an embedder spin; with nothing
+    // alive there is nothing of libuv's to wait for, so it sets no limit. Its timers count from the
+    // cached clock, which is refreshed first so a stale one cannot stretch the wait.
+    override backend_timeout(*self) -> Option[Duration]
+        if !self.lp.alive() then return None
+
+        self.lp.update_time()
+        val ms = self.lp.backend_timeout()
+
+        if ms < 0 then None else Some(millis(long(ms)))
+    end backend_timeout
 end Uv
 
 private[uv] nothing() = ()

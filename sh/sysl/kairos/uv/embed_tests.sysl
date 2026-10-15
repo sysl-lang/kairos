@@ -1,0 +1,218 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// The loop embedded in somebody else's, on libuv: an embedder that waits on `backend_fd` with
+// `poll(2)` for as long as `timeout` allows, then drives one `pass(NoWait)`, the way a GUI toolkit or
+// a language runtime would.
+//
+// What is checked is the embedding contract on both sides. **It must not stall**: every wait is also
+// capped at two seconds, and a wait that reached the cap fails the test, because without the cap it
+// would have slept for ever. **It must not spin**: the number of waits is bounded by the events the work
+// has, and the waits that were told zero are counted too.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{Handle, ip4}
+import sh.sysl.kairos.{Loop, event_loop, NoWait}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.{Duration, millis, whole_micros}
+
+private struct PollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+private extern "poll" poll_fds(fds: *PollFd, n: usize, ms: i32) -> i32
+
+private const poll_in: i16 = 1
+private const cap_ms: long = 2000
+
+private struct Embedded
+    waits: int
+    zeros: int
+
+// Round up, so a wait never ends before the deadline it was given and comes straight back.
+private whole_ms(d: Duration) -> long = (whole_micros(d) + 999) / 1000
+
+// The embedder's own loop: one `pass(NoWait)`, then, while there is more, a wait on the descriptor.
+private embed(lp: &Loop[Uv]) -> Embedded
+    var e = Embedded(0, 0)
+    val fd = lp.backend_fd().expect("libuv has a backend descriptor here")
+
+    while lp.pass(NoWait)
+        val ms = lp.timeout() match
+            Some(d) -> whole_ms(d)
+            None -> cap_ms
+
+        if ms == 0 then e.zeros += 1
+
+        var p = PollFd(i32(fd), poll_in, 0)
+        val started = whole_ms(lp.now())
+        val n = poll_fds(&p, 1, i32(if ms > cap_ms then cap_ms else ms))
+
+        assert(n >= 0, "poll failed")
+        assert(n > 0 || ms < cap_ms, "the embedder stalled: no limit was set and nothing woke the descriptor")
+        e.waits += 1
+        assert(e.waits < 1000, s"the embedder is spinning: ${e.waits} waits, ${e.zeros} of them told zero")
+
+    e
+end embed
+
+private async nap(lp: &Loop[Uv], ms: long, name: string, log: &Buf[string])
+    await lp.sleep(millis(ms))
+    log.push(name)
+
+@test("an embedder over backend_fd and timeout wakes for a kairos timer, which libuv cannot see")
+embedded_timer()
+    val io = uv()
+    val lp = event_loop(io)
+    val log: &Buf[string] = buf()
+    val start = io.now()
+
+    lp.spawn(nap(lp, 40, "forty", log))
+    lp.spawn(nap(lp, 15, "fifteen", log))
+
+    val e = embed(lp)
+    val took = io.now() - start
+
+    assert_eq(log.view(), ["fifteen", "forty"])
+    assert(took >= millis(40), "the timer fired no earlier than it was due")
+    assert(took < millis(1000), "and the embedder did not sleep past it")
+    assert(e.waits <= 6, s"two timers took ${e.waits} waits")
+end embedded_timer
+
+private local(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+private async serve_one(l: &Listener, log: &Buf[string])
+    val conn = (await l.accept()).expect("a connection")
+    val got = (await conn.read()).expect("bytes")
+
+    log.push(s"server read ${from_utf8_lossy(got)}")
+    (await conn.write(got)).expect("written back")
+    conn.close()
+    l.close()
+
+private async ask(io: &Uv, port: int, log: &Buf[string])
+    val conn = (await io.connect(local(port))).expect("connected")
+
+    (await conn.write("ping".bytes)).expect("written")
+    log.push(s"client read ${from_utf8_lossy((await conn.read()).expect("the echo"))}")
+    conn.close()
+
+@test("an embedder drives a TCP echo through the backend descriptor alone, without stalling")
+embedded_echo()
+    val io = uv()
+    val lp = event_loop(io)
+    val log: &Buf[string] = buf()
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    lp.spawn(serve_one(l, log))
+    lp.spawn(ask(io, port, log))
+
+    val e = embed(lp)
+
+    assert_eq(log.view(), ["server read ping", "client read ping"])
+    assert(e.waits < 50, s"one echo took ${e.waits} waits")
+    assert(!io.on_loop().alive(), "everything was closed")
+    assert_eq(lp.running(), 0)
+end embedded_echo
+
+// A read nothing will answer, under a timeout; then both ends close, which leaves the loop empty.
+private async quiet_read(lp: &Loop[Uv], c: &Connection, peer: &Connection, log: &Buf[string])
+    (await lp.timeout(millis(30), c.read())) match
+        Some(_) -> log.push("read")
+        None -> log.push("timed out")
+
+    c.close()
+    peer.close()
+
+@test("a read under a kairos timeout: the descriptor waits on the socket, the timeout on the timer")
+embedded_read_with_timeout()
+    val io = uv()
+    val lp = event_loop(io)
+    val log: &Buf[string] = buf()
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val client = lp.block_on(io.connect(local(port))).expect("ran").expect("connected")
+    val server = lp.block_on(l.accept()).expect("ran").expect("accepted")
+
+    l.close()
+    lp.spawn(quiet_read(lp, server, client, log))
+
+    val start = io.now()
+    lp.pass(NoWait)
+
+    assert(io.on_loop().alive(), "the read is in flight")
+    val t = lp.timeout().expect("the kairos timer sets a limit though libuv sets none")
+    assert(t <= millis(30) && t > millis(0), s"the limit is the timer's: ${whole_micros(t)}us")
+
+    val e = embed(lp)
+
+    assert_eq(log.view(), ["timed out"])
+    assert(io.now() - start >= millis(30))
+    assert(e.waits <= 5, s"one timeout took ${e.waits} waits")
+    assert(!io.on_loop().alive(), "everything was closed")
+end embedded_read_with_timeout
+
+private async late_child(io: &Uv, log: &Buf[string])
+    val p = io.spawn("/bin/sh", ["-c", "sleep 0.1; printf late"], stdout = Piped).expect("spawned")
+    val out = p.stdout().expect("piped")
+
+    loop
+        val got = (await out.read()).expect("the child's output")
+        if got.len == 0 then break
+        log.push(from_utf8_lossy(got))
+
+    log.push(s"exit ${(await p.exit()).status}")
+    out.close()
+
+// No timer anywhere: the only thing that can end the wait is the descriptor, so a read the pass began
+// and libuv had not yet handed to it would be a stall. That is what the pass's last poll is for.
+@test("an embedder with no timer at all is woken by a child's late output and its exit")
+embedded_child_with_no_timer()
+    val io = uv()
+    val lp = event_loop(io)
+    val log: &Buf[string] = buf()
+
+    lp.spawn(late_child(io, log))
+
+    val e = embed(lp)
+
+    assert_eq(log.view(), ["late", "exit 0"])
+    assert(e.waits < 20, s"one child took ${e.waits} waits")
+    assert(!io.on_loop().alive(), "the child's handle and its pipe were closed")
+end embedded_child_with_no_timer
+
+private nothing_to_do() = ()
+
+@test("timeout counts libuv's own timers, and is None, not zero, on a loop with nothing alive")
+timeout_reads_the_backend()
+    val io = uv()
+    val lp = event_loop(io)
+
+    assert(lp.backend_fd().is_some())
+    assert(lp.timeout().is_none(), "libuv answers 0 for a dead loop, which would spin an embedder")
+
+    val t = libuv.timer(io.on_loop()).expect("a timer")
+    t.start(25, 0, nothing_to_do).expect("started")
+
+    // A loop libuv has never turned answers zero -- it has work of its own queued -- so the embedder
+    // passes once first, as it would on being handed a zero.
+    assert(lp.pass(NoWait), "libuv's timer keeps the loop alive")
+
+    val d = lp.timeout().expect("libuv's timer sets a limit")
+    assert(d <= millis(25) && d > millis(0), s"the limit is libuv's timer: ${whole_micros(d)}us")
+
+    val k = lp.after(millis(5), (l) -> ())
+    assert(lp.timeout().expect("a limit") <= millis(5), "the nearer kairos timer wins")
+    lp.cancel(k)
+
+    t.close()
+    embed(lp)
+    assert(!io.on_loop().alive(), "the timer was closed")
+    assert(lp.timeout().is_none())
+end timeout_reads_the_backend
+#endif

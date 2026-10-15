@@ -3,7 +3,7 @@ module sh.sysl.kairos
 import sysl.sync.Atomic
 import sysl.buf.{Buf, buf}
 import sysl.container.{Heap, heap}
-import sysl.time.Duration
+import sysl.time.{Duration, micros}
 
 /** An event loop for a machine with interrupts and nothing else: numbered sources an interrupt
  * raises, timers on one clock, and closures that run on every pass.
@@ -61,6 +61,12 @@ signalled() -> bool = pending.load() != 0
  * such work, which keeps the loop alive while a task waits on it. `poll` takes in whatever has already
  * happened without waiting, and is called on a pass that does not idle, so a task that only yields
  * cannot starve the driver's events.
+ *
+ * Two more are for a loop embedded in somebody else's -- a GUI toolkit's, a runtime's -- which waits
+ * on its own and only calls `Loop.pass(NoWait)` when it wakes. `backend_fd` is the descriptor the
+ * driver's events make readable, where there is one. `backend_timeout` is the longest the embedder may
+ * wait on it before the driver has something of its own to do, and `None` where the driver sets no
+ * limit. Neither counts the loop's own timers or tasks; `Loop.timeout` adds those.
  */
 trait Driver
     now(*self) -> Duration
@@ -69,6 +75,21 @@ trait Driver
     busy(*self) -> bool = false
 
     poll(*self) = ()
+
+    backend_fd(*self) -> Option[int] = None
+
+    backend_timeout(*self) -> Option[Duration] = None
+
+/** How far one `Loop.pass` may wait for something to happen, as libuv's `uv_run` modes say it. */
+enum PassMode
+    /** Not at all: take in whatever the driver has ready, run what is due, and return. */
+    NoWait
+
+    /** Until the next timer, source, task or driver event, if nothing is ready already. */
+    Once
+
+    /** As `Once`, but no longer than `d`. */
+    Until(d: Duration)
 
 /** Why `Loop.on` refused a source. */
 enum SourceError
@@ -353,27 +374,95 @@ struct Loop[D: Driver]
      */
     timeout[T](&self, d: Duration, t: Task[T]) -> Task[Option[T]] = timeout_on(self, d, t)
 
+    /** One pass, for a program that drives the loop itself -- from inside another loop, or a `while`
+     * of its own -- and answer whether anything is left that could ever run, as `alive` says it.
+     *
+     * It first waits as `mode` allows, but never while a task is woken, an idle handle exists, a
+     * source is raised or a timer is due, and never when nothing is alive; then it runs the pass:
+     * due timers, idle handles, raised sources, woken tasks, check handles. Whatever the wait took in
+     * -- a socket's bytes, a timer falling due -- is handled in the same pass. Last, while the driver
+     * is busy, it is polled once more without waiting: that takes in what arrived during the pass and
+     * hands the driver what the pass started -- a read begun, a socket opened -- so the descriptor an
+     * embedder waits on is watching it before the embedder sleeps on it.
+     *
+     * **It never cancels.** A task parked on something nothing will raise stays parked: a later
+     * `spawn`, `signal` or `on` may yet wake it, which is the embedder's to know and not the loop's.
+     * `run` and `block_on` are the ones that give up on it.
+     *
+     * A `stop` called during the pass is answered with false, and taken back, so `while
+     * lp.pass(Once)` ends on it as `run` does.
+     */
+    pass(*self, mode: PassMode) -> bool
+        self.stopping = false
+
+        if self.alive()
+            self.time = self.driver.now()
+
+            mode match
+                NoWait -> self.driver.poll()
+                Once -> self.wait(None)
+                Until(d) -> self.wait(Some(self.time + d))
+
+        self.turn()
+
+        if self.driver.busy() then self.driver.poll()
+
+        val stopped = self.stopping
+        self.stopping = false
+
+        !stopped && self.alive()
+    end pass
+
+    /** How long an embedder may wait before the next `pass(NoWait)` has something to do: zero while
+     * a task is woken, an idle handle exists or a source is raised; otherwise the nearer of the next
+     * timer and the driver's `backend_timeout`; `None` when neither sets a limit, so only an event
+     * on `backend_fd` -- or a `spawn` or `signal` from the embedder itself -- gives the loop work.
+     */
+    timeout(*self) -> Option[Duration]
+        if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled() then return Some(micros(0))
+
+        val mine = self.next_deadline() match
+            Some(d) ->
+                val now = self.driver.now()
+                Some(if d > now then d - now else micros(0))
+            None -> None
+
+        (mine, self.driver.backend_timeout()) match
+            (Some(a), Some(b)) -> Some(if a < b then a else b)
+            (Some(a), None) -> Some(a)
+            (None, b) -> b
+    end timeout
+
+    /** The descriptor an embedder polls for the driver's events, as the driver's `backend_fd` gives
+     * it: libuv's epoll or kqueue descriptor on the `uv` driver, `None` on one that has no such thing.
+     */
+    backend_fd(*self) -> Option[int] = self.driver.backend_fd()
+
     // Passes until `done` says so, `stop` is called, or nothing is left; answers how many parked
     // tasks were cancelled because nothing was left that could wake them.
     private drive(*self, done: &Fn() -> bool) -> usize
         self.stopping = false
 
         while self.alive()
-            self.time = self.driver.now()
-            self.fire_timers()
-            self.run_handles(true)
-            self.drain()
-            self.step_ready()
-            self.run_handles(false)
+            self.turn()
 
             if self.stopping || done() || !self.alive() then break
 
-            self.wait()
+            self.wait(None)
 
         self.stopping = false
 
         if self.alive() || done() then 0 else self.cancel_parked()
     end drive
+
+    // The body of a pass, from reading the clock to the check handles.
+    private turn(*self)
+        self.time = self.driver.now()
+        self.fire_timers()
+        self.run_handles(true)
+        self.drain()
+        self.step_ready()
+        self.run_handles(false)
 
     // Step each task woken before this point once. Wakers called while stepping push onto the other
     // buffer, which the next pass steps.
@@ -473,12 +562,16 @@ struct Loop[D: Driver]
                     None -> ()
     end drain
 
-    private wait(*self)
+    // Wait for the nearest timer or the next event, but no later than `cap` where there is one.
+    private wait(*self, cap: Option[Duration])
         if self.idles.live > 0 || !self.ready.woken.is_empty() || signalled()
             self.driver.poll()
             return
 
-        val deadline = self.next_deadline()
+        val deadline = (self.next_deadline(), cap) match
+            (Some(a), Some(b)) -> Some(if a < b then a else b)
+            (Some(a), None) -> Some(a)
+            (None, b) -> b
 
         deadline match
             Some(d) -> if d > self.driver.now() then self.driver.idle_until(deadline) else self.driver.poll()
