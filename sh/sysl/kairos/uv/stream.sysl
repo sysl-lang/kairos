@@ -36,7 +36,7 @@ private[uv] async read_stream[S: Stream](s: &S, r: &Reader) -> Result[[]u8, Erro
         p.finish(got match
             libuv.Data(bytes) -> Ok(copy_of(bytes))
             libuv.End -> Ok([0; 0])
-            libuv.Failed(e) -> Err(e)), 65536)?
+            libuv.Failed(e) -> Err(e)))?
 
     r.reading = Some(p)
     defer stop_reading(s, r)
@@ -71,7 +71,7 @@ private[uv] async shutdown_stream[S: Stream](s: &S) -> Result[unit, Error]
 // Every stream here closes through this, so closing twice -- or closing and then dropping -- is safe,
 // and a task still reading ends with `ECANCELED` rather than waiting on a handle that is gone.
 private[uv] close_stream[S: Stream](s: &S, r: &Reader)
-    if !s.is_closing() then s.close(nothing)
+    if !s.is_closing() then s.close()
 
     r.reading match
         Some(p) ->

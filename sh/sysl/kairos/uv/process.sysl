@@ -54,7 +54,7 @@ struct Process
      * has exited, so a signal never reaches a process that has taken over its id.
      */
     kill(self, signum: i32) -> Result[unit, Error]
-        if self.ended.is_some() then return Err(libuv.Error(libuv.EINVAL))
+        if self.ended.is_some() then return Err(libuv.Error(libuv.ESRCH))
 
         val c = self.child
 
@@ -88,7 +88,7 @@ end Process
 
 // Every handle here that is not a stream closes through this, so closing twice is safe.
 private[uv] close_handle[H: Handle](h: &H)
-    if !h.is_closing() then h.close(nothing)
+    if !h.is_closing() then h.close()
 
 private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: []const string,
                      cwd: string, stdin: Stdio, stdout: Stdio, stderr: Stdio) -> Result[&Process, Error]

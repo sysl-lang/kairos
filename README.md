@@ -251,9 +251,19 @@ lp.run()
 | `conn.nodelay(on)` | Nagle's algorithm off (`true`) or on |
 | `io.read_file(path)`, `io.write_file(path, bytes)` | whole files, on libuv's thread pool |
 | `io.resolve(host, service)` | a name lookup, on the thread pool |
+| `io.open(path, flags, mode)` | a task ending with a `&File`; `f.read(n)`, `f.read_at(n, offset)`, `f.write(bytes)`, `f.write_at(bytes, offset)` and `f.close()` are tasks, and a `File` dropped open is closed |
+| `io.stat`, `io.scandir`, `io.mkdir`, `io.rmdir`, `io.unlink`, `io.rename`, `io.chmod` | the file system, each a task on the thread pool |
+| `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.adopt(fd)` | a `&Pipe` over a descriptor this process already has: a terminal, a pipe or a socket |
+| `io.socket_pair()` | two connected `&Pipe`s |
+| `p.read()`, `p.write(bytes)`, `p.shutdown()` | tasks on a `Pipe`, as on a `Connection`; `p.is_terminal()` says which it is |
+| `io.spawn(file, args, env, cwd, stdin, stdout, stderr)` | a `&Process`; each stream is `Inherit`, `Piped` or `Ignore`, and a `Piped` one is `proc.stdin()`, `proc.stdout()` or `proc.stderr()` |
+| `proc.exit()`, `proc.kill(signum)`, `proc.pid()` | a task ending with how the child ended (`Exit`'s `status` or `signal`); `kill` after it has exited is `ESRCH`, never a signal to a process that has taken over its id |
+| `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival |
+| `io.work(job)` | a task running a `&sync Fn() -> T` on the thread pool; dropping it takes a job no thread has started off the queue |
+| `io.remote(n)` | a `Remote` another thread calls `raise()` on: source `n` is raised and libuv woken at once |
 
-A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection
-or a listener ends a task waiting on it with `ECANCELED`. Closing twice does nothing, and a connection
+A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection,
+listener, pipe or signal watcher ends a task waiting on it with `ECANCELED`. Closing twice does nothing, and a connection
 or listener dropped without being closed is closed then, so a forgotten `close` leaks no descriptor
 and does not keep the loop alive.
 
@@ -351,7 +361,11 @@ deterministic, no real sleeping, each asserting a whole timeline of what ran and
 deadlines `idle_until` was handed; one on the host driver checks that two sleeps take at least their
 sum of real time. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
 refusal (`ECONNREFUSED`, `EADDRINUSE`, `ENOENT`, `EAI_NONAME`, `ECANCELED` on a close), a timeout
-around a read nothing answers, cancellation by drop, and a yielding task that must not starve libuv.
+around a read nothing answers, cancellation by drop, and a yielding task that must not starve libuv —
+and on child processes and pipes: exit statuses and signals, `ESRCH` for a child already gone, piped
+standard streams both ways, a socket pair, signals caught by task and by stream, every file-system
+call and a `File` read and written at offsets, a job on the thread pool, and a remote raised from
+another thread.
 ASan instruments the sysl half only: libuv is a `pkg_config` library someone else compiled.
 
 ## License

@@ -175,9 +175,9 @@ exit_status()
     assert_eq(e.signal, 0)
     assert(p.pid() > 0, "it had a process id")
 
-    // Already exited: the answer is at once, and a signal to it is refused rather than sent.
+    // Already exited: the answer is at once, and a signal to it is refused with ESRCH rather than sent.
     assert_eq(lp.block_on(p.exit()).expect("ran").status, 3)
-    assert(p.kill(libuv.SIGTERM).is_err(), "a child that has exited is not signalled")
+    assert_eq(p.kill(libuv.SIGTERM).unwrap_err(), libuv.Error(libuv.ESRCH))
     lp.run()
 
 @test("a child killed with SIGTERM reports the signal that ended it")

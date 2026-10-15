@@ -16,7 +16,7 @@
 package {
   name    = "kairos"
   version = "0.1.3"
-  sysl    = "0.1.0-alpha.11"
+  sysl    = "0.1.0-alpha.13"
 }
 
 // **`heap`, because handlers and timers are closures, a task's frame is on the heap, and the tables
@@ -32,7 +32,8 @@ requires {
 }
 
 // **`uv` is the one feature, and it is off unless a consumer asks for it**: it brings the libuv
-// driver, `sh.sysl.kairos.uv` -- `uv()`, TCP, whole files and name lookups -- and with it the
+// driver, `sh.sysl.kairos.uv` -- `uv()`, TCP, pipes and standard streams, files, child processes, signals, the thread pool and
+// name lookups -- and with it the
 // `libuv` package, which needs libuv installed (`brew install libuv`, Debian's `libuv1-dev`). With
 // it off, that module is empty and nothing of libuv is fetched, asked for or linked. It only adds.
 features {
@@ -40,5 +41,5 @@ features {
 }
 
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.12", optional = true }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.14", optional = true }
 }
