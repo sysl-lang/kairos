@@ -95,24 +95,21 @@ impl Drop for Socket
             Some(s) -> if !s.is_closing() then s.close()
             None -> ()
 
-private[uv] async write_handle_on[S: Stream](ch: Option[&libuv.Pipe], bytes: []const u8,
-                                            send: &S) -> Result[unit, Error]
-    val s = ch match
-        Some(it) -> it
-        None -> return Err(libuv.Error(libuv.EINVAL))
-
-    // libuv would send it, and the other end would read no bytes -- which is the end of the stream,
-    // with the handle lost on the way.
-    if bytes.len == 0 then return Err(libuv.Error(libuv.EINVAL))
-
+// Issued at the call, as `write_stream` is, so a handle's write keeps its place among the others.
+private[uv] write_handle_on[S: Stream](ch: Option[&libuv.Pipe], bytes: []const u8,
+                                       send: &S) -> Task[Result[unit, Error]]
     val p: &Pending[Result[unit, Error]] = pending()
 
-    s.write_handle(bytes, send, (r) -> p.finish(r))?
+    // Empty bytes: libuv would send them, and the other end would read none -- which is the end of
+    // the stream, with the handle lost on the way.
+    ch match
+        Some(s) if bytes.len > 0 ->
+            s.write_handle(bytes, send, (r) -> p.finish(r)) match
+                Err(e) -> p.finish(Err(e))
+                Ok(_) -> ()
+        _ -> p.finish(Err(libuv.Error(libuv.EINVAL)))
 
-    val r = await settled(p)
-
-    r?
-    Ok(())
+    completion(p)
 end write_handle_on
 
 // What a write that cannot be made ends with.

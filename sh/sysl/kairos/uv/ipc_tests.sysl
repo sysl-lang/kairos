@@ -175,15 +175,21 @@ private async two_at_once(io: &Uv) -> usize
     val l = io.listen(loopback(0)).expect("listening")
     val (near, far) = io.socket_pair().expect("a pair")
 
-    // Two writes in a row, each with a handle; however the kernel joins them, every handle arrives,
-    // in the order it was sent.
-    (await one.write_handle("a".bytes, PassListener(l))).expect("sent")
-    (await one.write_handle("b".bytes, PassPipe(near))).expect("sent")
+    // Two writes issued in one turn, each with a handle, and a plain write behind them, none awaited
+    // until all three are queued; however the kernel joins them, every handle arrives, in the order
+    // it was sent.
+    val first = one.write_handle("a".bytes, PassListener(l))
+    val second = one.write_handle("b".bytes, PassPipe(near))
+    val third = one.write("c".bytes)
+
+    (await third).expect("sent")
+    (await second).expect("sent")
+    (await first).expect("sent")
 
     var seen: Buf[Passed] = buf()
     var bytes: usize = 0
 
-    while bytes < 2
+    while bytes < 3
         val m = (await two.read_handles()).expect("read")
 
         bytes += m.bytes.len

@@ -17,28 +17,12 @@ module sh.sysl.kairos.uv
 import sh.sysl.libuv
 import sh.sysl.libuv.{Handle, Stream}
 
-/** A connected TCP socket. Reached through `&Connection`; `close` ends it. Its reading and writing
- * are `stream.sysl`'s, shared with `Pipe`.
+/** A connected TCP socket. Reached through `&Connection`; `close` ends it. Its reading, writing,
+ * half-close and close are `ByteStream`'s, shared with `Pipe`.
  */
 struct Connection
     private[uv] sock: &libuv.Tcp
     private reads: &Reader
-
-    /** A task that ends with the next bytes the peer sent -- at most 64 KiB -- or with an empty
-     * slice once the peer has closed its half. Dropping it before it ends consumes nothing.
-     */
-    read(self) -> Task[Result[[]u8, Error]] = read_stream(self.sock, self.reads)
-
-    /** A task that ends when `bytes` have been handed to the kernel. The bytes are copied at the
-     * start, so the caller's slice need not outlive it.
-     */
-    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = write_stream(self.sock, bytes)
-
-    /** A task that ends when this side's half of the stream is closed: every write queued before it
-     * has gone, and the peer reads the end of the stream. Reading goes on -- the peer may still
-     * answer, and `read` hands that over until the peer closes its own half.
-     */
-    shutdown(self) -> Task[Result[unit, Error]] = shutdown_stream(self.sock)
 
     /** Turn Nagle's algorithm off (`true`) or back on: with it off, a small write is sent at once
      * rather than held back to be joined with the next.
@@ -54,11 +38,19 @@ struct Connection
 
         Ok(s.peername()?)
 
-    /** Close the socket. A task still reading from it ends with `ECANCELED`. Closing again does
-     * nothing, and a connection dropped without being closed is closed then.
-     */
-    close(self) = close_stream(self.sock, self.reads)
+    /** The address of this end: the local interface and the port the kernel bound it to. */
+    local(self) -> Result[libuv.Address, Error]
+        val s = self.sock
+
+        Ok(s.sockname()?)
 end Connection
+
+// A connection dropped without being closed is closed then, as `close` would.
+impl ByteStream for Connection
+    read(self) -> Task[Result[[]u8, Error]] = read_stream(self.sock, self.reads)
+    write(self, bytes: []const u8) -> Task[Result[unit, Error]] = write_stream(self.sock, bytes)
+    shutdown(self) -> Task[Result[unit, Error]] = shutdown_stream(self.sock)
+    close(self) = close_stream(self.sock, self.reads)
 
 // A connection nobody holds any more is one nobody can close, so its going is the close -- and a read
 // still in flight on it ends with `ECANCELED`.
@@ -132,10 +124,11 @@ private[uv] async connect_on(lp: &libuv.Loop, addr: libuv.Address) -> Result[&Co
     connected = true
     Ok(Connection(s, reader()))
 
-private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int) -> Result[&Listener, Error]
+private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int,
+                      flags: u32) -> Result[&Listener, Error]
     val s = libuv.tcp(lp)?
 
-    s.bind(addr) match
+    s.bind(addr, flags) match
         Err(e) ->
             s.close()
             return Err(e)
