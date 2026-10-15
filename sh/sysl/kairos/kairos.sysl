@@ -560,10 +560,14 @@ struct Loop[D: Driver]
      * It first waits as `mode` allows, but never while a task is woken, an idle handle exists, a
      * source is raised or a timer is due, and never when nothing is alive; then it runs the pass:
      * due timers, idle handles, raised sources, woken tasks, check handles. Whatever the wait took in
-     * -- a socket's bytes, a timer falling due -- is handled in the same pass. Last, while the driver
-     * is busy, it is polled once more without waiting: that takes in what arrived during the pass and
-     * hands the driver what the pass started -- a read begun, a socket opened -- so the descriptor an
-     * embedder waits on is watching it before the embedder sleeps on it.
+     * -- a socket's bytes, a timer falling due -- is handled in the same pass.
+     *
+     * **A pass takes at most one turn of the driver**: `pass(Once)` is libuv's `RUN_ONCE` and
+     * `pass(NoWait)` its `RUN_NOWAIT`, with the kairos pass after it. What arrives after that turn,
+     * and what the pass started -- a read begun, a socket opened -- is taken in by the next pass, so
+     * a program that runs work of its own between passes sees every event before the loop takes
+     * another. An embedder loses nothing by it: libuv answers a zero `timeout` while it holds a
+     * watcher its descriptor is not yet watching, so the next `pass(NoWait)` comes at once.
      *
      * **It never cancels.** A task parked on something nothing will raise stays parked: a later
      * `spawn`, `signal` or `on` may yet wake it, which is the embedder's to know and not the loop's.
@@ -584,8 +588,6 @@ struct Loop[D: Driver]
                 Until(d) -> self.wait(Some(self.time + d))
 
         self.turn()
-
-        if self.driver.busy() then self.driver.poll()
 
         val stopped = self.stopping
         self.stopping = false

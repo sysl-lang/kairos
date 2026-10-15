@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.5" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6" }
 }
 ```
 
@@ -152,7 +152,10 @@ language runtime's — drives kairos one pass at a time instead:
 
 Each `pass` answers whether anything is left that could run, so `while lp.pass(Once)` is a serve
 loop; a `stop` during a pass makes that one answer false. **A pass never cancels**: a task parked on
-nothing stays parked, because the embedder may yet wake it. An embedder waits on `backend_fd` for
+nothing stays parked, because the embedder may yet wake it. **A pass takes at most one turn of the
+driver** — `pass(Once)` is libuv's `RUN_ONCE` and `pass(NoWait)` its `RUN_NOWAIT` — so work the
+program runs between passes sees every event before the loop takes another; what arrives after the
+turn, or what the pass started, is taken in by the next pass. An embedder waits on `backend_fd` for
 `timeout()` and then calls `pass(NoWait)`:
 
 ```sysl
@@ -163,7 +166,9 @@ while lp.pass(NoWait)
 ```
 
 kairos's timers are not libuv's, so libuv's `uv_backend_timeout` cannot see them, nor a task already
-woken; `timeout()` adds both. The `uv` driver answers `None` rather than libuv's zero for a libuv loop
+woken; `timeout()` adds both. A read or a connect a pass started is not yet on libuv's descriptor,
+and libuv says so by answering zero, so the embedder passes again at once rather than sleeping on
+it. The `uv` driver answers `None` rather than libuv's zero for a libuv loop
 with nothing alive, which would otherwise spin the embedder.
 
 ## Other threads, and background waits
@@ -287,7 +292,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.5", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6", features = [uv] }
 }
 ```
 
@@ -438,7 +443,8 @@ SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test . --features uv
 deterministic, no real sleeping, each asserting a whole timeline of what ran and when, and the
 deadlines `idle_until` was handed; one on the host driver checks that two sleeps take at least their
 sum of real time; `pass` and `timeout` are checked the same way, in every mode, with a parked task
-that survives empty passes and a serve loop over `pass(Once)`. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
+that survives empty passes and a serve loop over `pass(Once)`, and a counting driver holds every
+mode to one driver turn a pass. The `uv` tests run on the loopback and the temporary directory — a TCP echo, every
 refusal (`ECONNREFUSED`, `EADDRINUSE`, `ENOENT`, `EAI_NONAME`, `ECANCELED` on a close), a timeout
 around a read nothing answers, cancellation by drop, and a yielding task that must not starve libuv —
 and on child processes and pipes: exit statuses and signals, `ESRCH` for a child already gone, piped
@@ -446,7 +452,9 @@ standard streams both ways, a socket pair, signals caught by task and by stream,
 call and a `File` read and written at offsets, a job on the thread pool, and a remote raised from
 another thread. An embedder over `poll(2)` on `backend_fd`, waiting for `timeout()` and driving
 `pass(NoWait)`, runs kairos timers, a TCP echo, a read under a timeout and a child with no timer at
-all, failing on a wait that would have been for ever and on a thousand waits. Notifiers and remotes
+all, failing on a wait that would have been for ever and on a thousand waits; and a channel whose
+bytes and end of stream arrive as two events is answered between passes before the end is read.
+Notifiers and remotes
 are checked on the simulated driver for coalescing, what keeps a loop alive, background waits left
 parked rather than cancelled, and no cross-talk between notifiers or loops; on the host driver across
 a real thread; and on the `uv` driver with 1,024 loops on 1,024 threads, each woken alone and in turn,

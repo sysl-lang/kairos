@@ -3,7 +3,7 @@ module sh.sysl.kairos.sim
 
 import sysl.buf.{Buf, buf}
 import sysl.time.{Duration, millis, whole_micros}
-import sh.sysl.kairos.{Loop, event_loop, signal, signalled, NoWait, Once, Until}
+import sh.sysl.kairos.{Driver, Loop, PassMode, event_loop, signal, signalled, NoWait, Once, Until}
 
 /** `Loop.pass` and `Loop.timeout`, on the simulated driver: a loop driven one pass at a time by a
  * program of its own, which is how a loop is embedded in somebody else's.
@@ -302,3 +302,58 @@ timeout_idle_and_sources()
     assert(lp.timeout().is_none())
     lp.off(5)
 end timeout_idle_and_sources
+
+// ---- one driver turn a pass ---------------------------------------------------------------------
+
+/** A driver that is always busy, as a libuv loop with a socket open is, and counts its turns: a wait
+ * and a poll are one turn each. Its waits return at once, moving the clock to the deadline.
+ */
+private struct Turns
+    clock: Duration
+    waits: int
+    polls: int
+
+impl Driver for Turns
+    now(*self) -> Duration = self.clock
+
+    idle_until(*self, deadline: Option[Duration])
+        self.waits += 1
+        deadline match
+            Some(d) -> if d > self.clock then self.clock = d
+            None -> ()
+
+    override busy(*self) -> bool = true
+
+    override poll(*self)
+        self.polls += 1
+end Turns
+
+// Run one pass and answer how many turns of the driver it took.
+private one_pass(d: &Turns, lp: &Loop[Turns], mode: PassMode) -> int
+    val before = d.waits + d.polls
+
+    assert(lp.pass(mode), "a busy driver keeps the loop alive")
+    d.waits + d.polls - before
+end one_pass
+
+@test("a pass takes exactly one driver turn in every mode, with a task woken, a timer due, or nothing")
+one_turn_a_pass()
+    assert(!signalled())
+    val d: &Turns = Turns(millis(0), 0, 0)
+    val lp = event_loop(d)
+    val log: &Buf[string] = buf()
+
+    for mode in [NoWait, Once, Until(millis(5))]
+        assert_eq(one_pass(d, lp, mode), 1, "nothing to do")
+
+        lp.spawn(steps(log, "s", 2))
+        assert_eq(one_pass(d, lp, mode), 1, "a task woken, which spawns its next step")
+        assert_eq(one_pass(d, lp, mode), 1, "the task's second step")
+        assert_eq(one_pass(d, lp, mode), 1, "the task ends")
+
+        lp.after(millis(0), (l) -> log.push("due"))
+        assert_eq(one_pass(d, lp, mode), 1, "a timer due")
+
+    assert_eq(log.len(), 9)
+    assert_eq(d.polls + d.waits, 15)
+end one_turn_a_pass

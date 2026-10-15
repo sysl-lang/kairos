@@ -14,8 +14,9 @@ module sh.sysl.kairos.uv
 
 import sh.sysl.libuv
 import sh.sysl.libuv.{Handle, ip4}
-import sh.sysl.kairos.{Loop, event_loop, NoWait}
+import sh.sysl.kairos.{Loop, event_loop, NoWait, Once}
 import sysl.buf.{Buf, buf}
+import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.from_utf8_lossy
 import sysl.time.{Duration, millis, whole_micros}
 
@@ -145,7 +146,12 @@ embedded_read_with_timeout()
     val start = io.now()
     lp.pass(NoWait)
 
+    // The pass began the read and took no second turn to hand it to libuv's descriptor, so libuv
+    // answers zero until the next pass has.
     assert(io.on_loop().alive(), "the read is in flight")
+    assert_eq(whole_micros(lp.timeout().expect("a limit")), 0, "a read not yet on the descriptor")
+    lp.pass(NoWait)
+
     val t = lp.timeout().expect("the kairos timer sets a limit though libuv sets none")
     assert(t <= millis(30) && t > millis(0), s"the limit is the timer's: ${whole_micros(t)}us")
 
@@ -170,7 +176,8 @@ private async late_child(io: &Uv, log: &Buf[string])
     out.close()
 
 // No timer anywhere: the only thing that can end the wait is the descriptor, so a read the pass began
-// and libuv had not yet handed to it would be a stall. That is what the pass's last poll is for.
+// and libuv had not yet handed to it would be a stall. libuv's zero `timeout` for a watcher not yet
+// on its descriptor is what prevents it.
 @test("an embedder with no timer at all is woken by a child's late output and its exit")
 embedded_child_with_no_timer()
     val io = uv()
@@ -215,4 +222,60 @@ timeout_reads_the_backend()
     assert(!io.on_loop().alive(), "the timer was closed")
     assert(lp.timeout().is_none())
 end timeout_reads_the_backend
+
+// The peer's end of the channel is written straight through the descriptor, so its bytes and its end
+// of stream are in the kernel before the loop takes a single turn.
+private extern "write" fd_write(fd: i32, p: *u8, n: usize) -> isize
+private extern "read" fd_read(fd: i32, p: *u8, n: usize) -> isize
+private extern "shutdown" fd_shutdown(fd: i32, how: i32) -> i32
+private extern "close" fd_close(fd: i32) -> i32
+
+private const shut_wr: i32 = 1
+
+// A channel whose peer has sent "shutdown" and then ended the stream. libuv takes the bytes on one
+// readable event and the end on the next, and the channel is closed when the end arrives. The program
+// runs its own work between passes -- slate's microtasks -- and answers "drained" on the channel the
+// moment it sees "shutdown". That answer is owed before the loop takes another turn: a pass that took
+// a second one would read the end first and close the channel under it.
+@test("a pass takes one libuv turn, so work run between passes answers before the next event is read")
+one_turn_between_events()
+    val io = uv()
+    val lp = event_loop(io)
+    val log: &Buf[string] = buf()
+    val (mine, theirs) = libuv.socket_pair().expect("a pair")
+    val ch = libuv.pipe(false, io.on_loop()).expect("a pipe")
+
+    ch.open(mine).expect("adopted")
+    ch.read_start((r) -> r match
+        libuv.Data(bytes) -> log.push(from_utf8_lossy(bytes))
+        libuv.End ->
+            log.push("end")
+            ch.close()
+        libuv.Failed(e) -> log.push(s"failed ${e.code}")).expect("reading")
+
+    val msg = "shutdown".bytes
+    assert_eq(fd_write(theirs, as_ptr(msg), msg.len), isize(msg.len))
+    assert_eq(fd_shutdown(theirs, shut_wr), 0)
+
+    var passes = 0
+    var answered = false
+
+    while lp.pass(Once)
+        passes += 1
+        assert(passes < 20, "the channel never ended")
+
+        if !answered && log.len() > 0 && log[0] == "shutdown"
+            answered = true
+            log.push(ch.write("drained".bytes) match
+                Ok(_) -> "answered"
+                Err(e) -> s"answer refused ${e.code}")
+
+    assert_eq(log.view(), ["shutdown", "answered", "end"])
+
+    var got: [16]u8 = [0; 16]
+    val n = fd_read(theirs, as_mut_ptr(got[..]), got.len)
+
+    assert_eq(from_utf8_lossy(got[0..<usize(n)]), "drained", "the answer reached the peer")
+    fd_close(theirs)
+end one_turn_between_events
 #endif
