@@ -89,14 +89,21 @@ struct Uv
      */
     adopt(self, fd: i32) -> Result[&Pipe, Error] = adopt_on(self.lp, fd)
 
+    /** The ipc channel a parent gave this process at descriptor `fd` -- a `Channel` slot of its
+     * `spawn` -- opened as one, so it carries handles as well as bytes. libuv owns the descriptor
+     * afterwards. `EBADF` for a descriptor that is not open, and a terminal is refused with `EINVAL`.
+     */
+    channel(self, fd: i32) -> Result[&Pipe, Error] = channel_on(self.lp, fd)
+
     /** Start `file` -- looked up on `PATH` unless it holds a slash -- with `args`, which do not
      * include its own name. `env` of `[]` inherits this process's environment, and anything else
      * replaces it; `cwd` of `""` starts it here. A program that is not there is `ENOENT`, from this
-     * call.
+     * call. `extra` says what the child's descriptors from 3 on are, in order.
      */
     spawn(self, file: string, args: []const string, env: []const string = [], cwd: string = "",
-          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit) -> Result[&Process, Error] =
-        spawn_on(self.lp, file, args, env, cwd, stdin, stdout, stderr)
+          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit,
+          extra: []const Stdio = []) -> Result[&Process, Error] =
+        spawn_on(self.lp, file, args, env, cwd, stdin, stdout, stderr, extra)
 
     /** A task that ends with `signum` at its next arrival, on a watcher of its own. */
     signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum)

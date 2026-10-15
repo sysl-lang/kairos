@@ -71,7 +71,7 @@ private close_tcp(s: &libuv.Tcp)
 
 /** A listening socket. `accept` takes the next connection; `close` stops listening. */
 struct Listener
-    private sock: &libuv.Tcp
+    private[uv] sock: &libuv.Tcp
     private arrived: usize
     private closed: bool
     private waiter: Option[&Pending[unit]]
@@ -141,6 +141,13 @@ private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int) -> Res
             return Err(e)
         Ok(_) -> ()
 
+    listening(s, backlog)
+end listen_on
+
+/** A listener over a socket that is already bound -- one bound here, or one another process sent
+ * over a channel. It is closed if it cannot listen.
+ */
+private[uv] listening(s: &libuv.Tcp, backlog: int) -> Result[&Listener, Error]
     var l: &Listener = Listener(s, 0, false, None)
 
     // Weak, or the socket -- which the loop holds until it is closed -- would hold the listener,
@@ -156,7 +163,10 @@ private[uv] listen_on(lp: &libuv.Loop, addr: libuv.Address, backlog: int) -> Res
         Ok(_) -> ()
 
     Ok(l)
-end listen_on
+end listening
+
+/** A connection over a socket that is already connected: one another process sent over a channel. */
+private[uv] connection_of(s: &libuv.Tcp) -> &Connection = Connection(s, reader())
 
 private async accept_from(l: &Listener) -> Result[&Connection, Error]
     if l.arrived == 0

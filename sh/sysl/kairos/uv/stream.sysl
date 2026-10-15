@@ -44,7 +44,7 @@ private[uv] async read_stream[S: Stream](s: &S, r: &Reader) -> Result[[]u8, Erro
     await settled(p)
 end read_stream
 
-private stop_reading[S: Stream](s: &S, r: &Reader)
+private[uv] stop_reading[S: Stream](s: &S, r: &Reader)
     r.reading = None
     if !s.is_closing() then s.read_stop()
 
@@ -84,7 +84,7 @@ private[uv] cancelled() -> Error = libuv.Error(libuv.ECANCELED)
 
 // libuv reads every chunk into the one buffer it reuses, so a chunk a task keeps is a copy -- made
 // with one `memmove` rather than byte by byte.
-private copy_of(bytes: []const u8) -> []u8
+private[uv] copy_of(bytes: []const u8) -> []u8
     var out: []u8 = [0; bytes.len]
 
     copy(out, bytes)
@@ -128,6 +128,37 @@ struct Pipe
     is_terminal(self) -> bool = self.end match
         Piped(_) -> false
         Terminal(_) -> true
+
+    /** A task that ends when `bytes` have been handed to the kernel with `h` beside them, for the
+     * other end to take with `read_handles`. **Only a channel can** -- a `Channel` slot of `spawn`,
+     * or `io.channel(fd)` in the child -- and anything else is `EINVAL`, as is passing a terminal.
+     * Empty `bytes` are `EINVAL` too: a handle travels attached to them, and the other end would
+     * read none as the end of the stream.
+     *
+     * What crosses is a duplicate of the descriptor: **this side still has its own, and still closes
+     * it** -- after the task has ended, since the descriptor is read as the write goes.
+     */
+    write_handle(self, bytes: []const u8, h: Passing) -> Task[Result[unit, Error]]
+        val ch = self.channel_end()
+
+        h match
+            PassConnection(c) -> write_handle_on(ch, bytes, c.sock)
+            PassListener(l) -> write_handle_on(ch, bytes, l.sock)
+            PassPipe(p) -> p.end match
+                Piped(it) -> write_handle_on(ch, bytes, it)
+                Terminal(_) -> refused(libuv.Error(libuv.EINVAL))
+
+    /** A task that ends with the next bytes that arrived, as `read` does, and every socket or pipe
+     * the other end sent beside them -- taken as they arrived, since libuv keeps a pending handle only
+     * that long. A pipe that is not a channel can be sent none, so it only ever answers bytes; a
+     * terminal answers `EINVAL`.
+     */
+    read_handles(self) -> Task[Result[Message, Error]] = read_handles_on(self.channel_end(), self.reads)
+
+    // The pipe under this end, which only a channel's is worth asking for: a terminal has none.
+    private channel_end(self) -> Option[&libuv.Pipe] = self.end match
+        Piped(p) -> Some(p)
+        Terminal(_) -> None
 
     /** Close it, and the descriptor under it. A task still reading ends with `ECANCELED`. Closing
      * again does nothing.

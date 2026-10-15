@@ -1,0 +1,188 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+
+// Channels: a pipe between a parent and a child that carries sockets and pipes beside its bytes.
+//
+//     // the parent
+//     val p = io.spawn(exe, ["--worker"], extra = [Channel])?
+//     val ch = p.pipe(3).expect("a channel")
+//     (await ch.write_handle("listen".bytes, PassListener(l)))?
+//
+//     // the child
+//     val ch = io.channel(3)?
+//     val m = (await ch.read_handles())?
+//     m.handles[0] match
+//         PassedSocket(s) -> serve(s.listen()?)
+//         PassedPipe(_) -> ...
+//
+// **What crosses is a descriptor, duplicated by the kernel**, so each side has a working handle
+// afterwards and each closes its own. That is how a supervisor spreads one listening socket over its
+// workers, or hands each an accepted connection.
+//
+// **A pending handle is taken in the read that carried it.** libuv keeps it only as long as the read
+// callback runs, so `read_handles` accepts every one there and hands them over with the bytes; a
+// plain `read` on a channel leaves them where nothing will take them.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{Handle, Stream}
+import sysl.buf.{Buf, buf}
+
+/** What `write_handle` sends beside its bytes. */
+enum Passing
+    /** A connected TCP socket. */
+    PassConnection(c: &Connection)
+
+    /** A listening TCP socket, which the other side takes with `Socket.listen`. */
+    PassListener(l: &Listener)
+
+    /** A pipe or a Unix-domain socket -- not a terminal. */
+    PassPipe(p: &Pipe)
+
+/** A handle that arrived over a channel. */
+enum Passed
+    /** A TCP socket, which the receiver takes as a connection or as a listener. */
+    PassedSocket(s: &Socket)
+
+    /** A pipe or a Unix-domain socket. */
+    PassedPipe(p: &Pipe)
+
+/** What `read_handles` ends with: the bytes, empty at the end of the stream, and every handle that
+ * came with them, in the order they were sent.
+ */
+struct Message
+    bytes: []u8
+    handles: []Passed
+
+/** A TCP socket that arrived over a channel. **libuv cannot say whether the sender was listening on
+ * it or connected with it**, so the receiver says, by taking it as one or the other -- once. A socket
+ * dropped untaken is closed.
+ */
+struct Socket
+    private sock: Option[&libuv.Tcp]
+
+    /** Take it as a connection: a socket someone else accepted or connected, with a peer on the
+     * other end. `EINVAL` once it has been taken.
+     */
+    connection(*self) -> Result[&Connection, Error]
+        val s = self.take()?
+
+        Ok(connection_of(s))
+
+    /** Take it as a listener: a socket someone else bound and is listening on, which this process
+     * may now accept from as well. `EINVAL` once it has been taken.
+     */
+    listen(*self, backlog: int = 128) -> Result[&Listener, Error] = listening(self.take()?, backlog)
+
+    /** Close it without taking it. Closing again, or after it was taken, does nothing. */
+    close(*self)
+        self.sock match
+            Some(s) ->
+                self.sock = None
+                if !s.is_closing() then s.close()
+            None -> ()
+
+    private take(*self) -> Result[&libuv.Tcp, Error] = self.sock match
+        Some(s) ->
+            self.sock = None
+            Ok(s)
+        None -> Err(libuv.Error(libuv.EINVAL))
+end Socket
+
+impl Drop for Socket
+    drop(self)
+        self.sock match
+            Some(s) -> if !s.is_closing() then s.close()
+            None -> ()
+
+private[uv] async write_handle_on[S: Stream](ch: Option[&libuv.Pipe], bytes: []const u8,
+                                            send: &S) -> Result[unit, Error]
+    val s = ch match
+        Some(it) -> it
+        None -> return Err(libuv.Error(libuv.EINVAL))
+
+    // libuv would send it, and the other end would read no bytes -- which is the end of the stream,
+    // with the handle lost on the way.
+    if bytes.len == 0 then return Err(libuv.Error(libuv.EINVAL))
+
+    val p: &Pending[Result[unit, Error]] = pending()
+
+    s.write_handle(bytes, send, (r) -> p.finish(r))?
+
+    val r = await settled(p)
+
+    r?
+    Ok(())
+end write_handle_on
+
+// What a write that cannot be made ends with.
+private[uv] async refused(e: Error) -> Result[unit, Error] = Err(e)
+
+private[uv] async read_handles_on(ch: Option[&libuv.Pipe], r: &Reader) -> Result[Message, Error]
+    val s = ch match
+        Some(it) -> it
+        None -> return Err(libuv.Error(libuv.EINVAL))
+
+    if s.is_closing() then return Err(cancelled())
+
+    val p: &Pending[Result[[]u8, Error]] = pending()
+
+    // One buffer under two names: the callback pushes into it, and the message hands it over.
+    val handles: Buf[Passed] = buf()
+
+    s.read_start((got) ->
+        s.read_stop()
+        p.finish(got match
+            libuv.Data(bytes) -> take_pending(s, handles) match
+                Ok(_) -> Ok(copy_of(bytes))
+                Err(e) -> Err(e)
+            libuv.End -> Ok([0; 0])
+            libuv.Failed(e) -> Err(e)))?
+
+    r.reading = Some(p)
+    defer stop_reading(s, r)
+
+    val got = await settled(p)
+
+    Ok(Message(got?, handles.view()))
+end read_handles_on
+
+// Every handle pending on `ch`, accepted into one of ours. **A kind there is no type for here -- a UDP
+// socket from some other program -- is accepted and closed**, since one left pending would hold up
+// every handle behind it.
+private take_pending(ch: &libuv.Pipe, into: Buf[Passed]) -> Result[unit, Error]
+    while ch.pending_count() > 0
+        val kind = ch.pending_type()
+
+        if kind == libuv.HANDLE_TCP
+            val t = libuv.tcp(ch.on_loop())?
+            val s: &Socket = Socket(Some(t))
+
+            ch.accept_pending(t)?
+            into.push(PassedSocket(s))
+        else
+            val q = libuv.pipe(false, ch.on_loop())?
+            val it = piped(q)
+
+            ch.accept_pending(q)?
+
+            if kind == libuv.HANDLE_NAMED_PIPE then into.push(PassedPipe(it)) else it.close()
+
+    Ok(())
+end take_pending
+
+/** The ipc channel at descriptor `fd`. A terminal is refused, since nothing can be passed over one. */
+private[uv] channel_on(lp: &libuv.Loop, fd: i32) -> Result[&Pipe, Error]
+    if libuv.guess_handle(fd) == libuv.HANDLE_TTY then return Err(libuv.Error(libuv.EINVAL))
+
+    val p = libuv.pipe(true, lp)?
+
+    p.open(fd) match
+        Err(e) ->
+            p.close()
+            return Err(e)
+        Ok(_) -> ()
+
+    Ok(piped(p))
+end channel_on
+#endif

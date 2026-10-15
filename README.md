@@ -256,7 +256,10 @@ lp.run()
 | `io.stdin()`, `io.stdout()`, `io.stderr()`, `io.adopt(fd)` | a `&Pipe` over a descriptor this process already has: a terminal, a pipe or a socket |
 | `io.socket_pair()` | two connected `&Pipe`s |
 | `p.read()`, `p.write(bytes)`, `p.shutdown()` | tasks on a `Pipe`, as on a `Connection`; `p.is_terminal()` says which it is |
-| `io.spawn(file, args, env, cwd, stdin, stdout, stderr)` | a `&Process`; each stream is `Inherit`, `Piped` or `Ignore`, and a `Piped` one is `proc.stdin()`, `proc.stdout()` or `proc.stderr()` |
+| `io.spawn(file, args, env, cwd, stdin, stdout, stderr, extra)` | a `&Process`; each descriptor is `Inherit`, `Piped`, `Ignore` or `Channel`, `extra` lists descriptors 3 on, and a piped one is `proc.stdin()`, `proc.stdout()`, `proc.stderr()` or `proc.pipe(fd)` |
+| `io.channel(fd)` | the child's end of a `Channel`: a `&Pipe` that carries handles as well as bytes |
+| `ch.write_handle(bytes, h)` | a task sending `PassConnection(c)`, `PassListener(l)` or `PassPipe(p)` beside `bytes` over a channel; each side keeps, and closes, its own descriptor |
+| `ch.read_handles()` | a task ending with a `Message`: the bytes, and each handle sent with them as `PassedSocket(s)` (taken with `s.connection()` or `s.listen()`) or `PassedPipe(p)` |
 | `proc.exit()`, `proc.kill(signum)`, `proc.pid()` | a task ending with how the child ended (`Exit`'s `status` or `signal`); `kill` after it has exited is `ESRCH`, never a signal to a process that has taken over its id |
 | `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival |
 | `io.work(job)` | a task running a `&sync Fn() -> T` on the thread pool; dropping it takes a job no thread has started off the queue |

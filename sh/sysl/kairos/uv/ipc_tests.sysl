@@ -1,0 +1,386 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// Channels and the descriptors past a child's first three: bytes and handles between two ends in
+// this process, between this process and a shell, and between this process and a child that is this
+// very test binary run again.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.ip4
+import sh.sysl.kairos.{Loop, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.time.millis
+
+private text(bytes: []const u8) -> string = from_utf8_lossy(bytes)
+
+private loopback(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+// Two channels joined to each other: what a parent's `Channel` slot and the child's `io.channel(3)`
+// are, without the child.
+private channel_pair(io: &Uv) -> (&Pipe, &Pipe)
+    val (a, b) = libuv.socket_pair().expect("a socket pair")
+
+    (io.channel(a).expect("a channel"), io.channel(b).expect("a channel"))
+
+// A connected client and the connection a listener accepted for it.
+private async connected_pair(io: &Uv) -> (&Connection, &Connection)
+    val l = io.listen(loopback(0)).expect("listening")
+    val client = (await io.connect(loopback(l.port().expect("a port")))).expect("connected")
+    val server = (await l.accept()).expect("accepted")
+
+    l.close()
+    (client, server)
+
+private extern "dup" dup_fd(fd: i32) -> i32
+private extern "close" close_raw(fd: i32) -> i32
+
+// The descriptor the kernel would hand out next, which rises with every one left open.
+private lowest_free() -> i32
+    val fd = dup_fd(2)
+
+    assert(fd >= 0, "a descriptor to probe with")
+    close_raw(fd)
+    fd
+
+// -- Descriptors past the first three --------------------------------------------------------------
+
+@test("a child writes on descriptors 3 and 4, each its own pipe")
+extra_descriptors()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "echo three >&3; echo four >&4"], extra = [Piped, Piped])
+        .expect("spawned")
+
+    assert(p.stdout().is_none() && p.pipe(2).is_none(), "the first three were inherited")
+    assert(p.pipe(5).is_none() && p.pipe(-1).is_none(), "nothing past the slots given")
+    assert_eq(text(lp.block_on(p.pipe(3).expect("piped").read()).expect("ran").expect("read")), "three\n")
+    assert_eq(text(lp.block_on(p.pipe(4).expect("piped").read()).expect("ran").expect("read")), "four\n")
+    assert_eq(lp.block_on(p.exit()).expect("ran").status, 0)
+    lp.run()
+    assert(!io.on_loop().alive(), "the child and both pipes were closed")
+
+@test("an ignored slot has no pipe and still holds its place, so the next is descriptor 4")
+extra_slot_ignored()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "echo four >&4"], extra = [Ignore, Piped]).expect("spawned")
+
+    assert(p.pipe(3).is_none(), "3 was not piped")
+    assert_eq(text(lp.block_on(p.pipe(4).expect("piped").read()).expect("ran").expect("read")), "four\n")
+    assert_eq(lp.block_on(p.exit()).expect("ran").status, 0)
+    lp.run()
+
+@test("a channel on descriptor 3 carries a message to a shell and its answer back")
+channel_to_a_shell()
+    val io = uv()
+    val lp = event_loop(io)
+    val p = io.spawn("/bin/sh", ["-c", "read line <&3; echo \"got $line\" >&3"], extra = [Channel])
+        .expect("spawned")
+    val ch = p.pipe(3).expect("a channel")
+
+    lp.block_on(ch.write("hello\n".bytes)).expect("ran").expect("written")
+
+    val m = lp.block_on(ch.read_handles()).expect("ran").expect("read")
+
+    assert_eq(text(m.bytes), "got hello\n")
+    assert_eq(m.handles.len, 0)
+    assert_eq(lp.block_on(p.exit()).expect("ran").status, 0)
+    ch.close()
+    lp.run()
+
+// -- Handles over a channel ------------------------------------------------------------------------
+
+private async pass_a_connection(io: &Uv) -> string
+    val (one, two) = channel_pair(io)
+    val (client, server) = await connected_pair(io)
+
+    (await one.write_handle("conn".bytes, PassConnection(server))).expect("sent")
+    server.close()
+
+    val m = (await two.read_handles()).expect("read")
+
+    assert_eq(text(m.bytes), "conn")
+    assert_eq(m.handles.len, 1)
+
+    val got = m.handles[0] match
+        PassedSocket(s) ->
+            val c = s.connection().expect("a connection")
+
+            assert_eq(s.connection().unwrap_err(), libuv.Error(libuv.EINVAL))
+            assert_eq(s.listen().unwrap_err(), libuv.Error(libuv.EINVAL))
+            c
+        PassedPipe(_) -> panic("a TCP socket was sent")
+
+    (await got.write("over the duplicate".bytes)).expect("written")
+    got.close()
+
+    val heard = (await client.read()).expect("read")
+
+    client.close()
+    one.close()
+    two.close()
+    text(heard)
+end pass_a_connection
+
+@test("a connection crosses a channel, and the far side answers the client on it")
+connection_over_a_channel()
+    val io = uv()
+    val lp = event_loop(io)
+
+    assert_eq(lp.block_on(pass_a_connection(io)).expect("ran"), "over the duplicate")
+    lp.run()
+    assert(!io.on_loop().alive(), "everything was closed")
+
+private async pass_a_pipe(io: &Uv) -> string
+    val (one, two) = channel_pair(io)
+    val (near, far) = io.socket_pair().expect("a pair")
+
+    (await one.write_handle("pipe".bytes, PassPipe(near))).expect("sent")
+    near.close()
+
+    val m = (await two.read_handles()).expect("read")
+    val got = m.handles[0] match
+        PassedPipe(p) -> p
+        PassedSocket(_) -> panic("a pipe was sent")
+
+    (await got.write("through".bytes)).expect("written")
+    got.close()
+
+    val heard = (await far.read()).expect("read")
+
+    far.close()
+    one.close()
+    two.close()
+    text(heard)
+end pass_a_pipe
+
+@test("a pipe crosses a channel, and writing to it reaches the other end of its pair")
+pipe_over_a_channel()
+    val io = uv()
+    val lp = event_loop(io)
+
+    assert_eq(lp.block_on(pass_a_pipe(io)).expect("ran"), "through")
+    lp.run()
+    assert(!io.on_loop().alive(), "everything was closed")
+
+private is_socket(h: Passed) -> bool = h match
+    PassedSocket(_) -> true
+    PassedPipe(_) -> false
+
+private async two_at_once(io: &Uv) -> usize
+    val (one, two) = channel_pair(io)
+    val l = io.listen(loopback(0)).expect("listening")
+    val (near, far) = io.socket_pair().expect("a pair")
+
+    // Two writes in a row, each with a handle; however the kernel joins them, every handle arrives,
+    // in the order it was sent.
+    (await one.write_handle("a".bytes, PassListener(l))).expect("sent")
+    (await one.write_handle("b".bytes, PassPipe(near))).expect("sent")
+
+    var seen: Buf[Passed] = buf()
+    var bytes: usize = 0
+
+    while bytes < 2
+        val m = (await two.read_handles()).expect("read")
+
+        bytes += m.bytes.len
+        seen.extend(m.handles)
+
+    assert_eq(seen.len(), 2)
+    assert(is_socket(seen[0]), "the listener first")
+    assert(!is_socket(seen[1]), "then the pipe")
+
+    l.close()
+    near.close()
+    far.close()
+    one.close()
+    two.close()
+    seen.len()
+end two_at_once
+
+@test("handles sent one after another arrive in the order they were sent")
+handles_in_order()
+    val io = uv()
+    val lp = event_loop(io)
+
+    assert_eq(lp.block_on(two_at_once(io)).expect("ran"), 2)
+    lp.run()
+    assert(!io.on_loop().alive(), "the received handles were closed as they were dropped")
+
+private async send_and_drop(io: &Uv)
+    val (one, two) = channel_pair(io)
+    val l = io.listen(loopback(0)).expect("listening")
+
+    (await one.write_handle("x".bytes, PassListener(l))).expect("sent")
+    l.close()
+
+    // Taken and never asked for: the socket is closed as the message goes.
+    val m = (await two.read_handles()).expect("read")
+
+    assert_eq(m.handles.len, 1)
+    one.close()
+    two.close()
+
+@test("a socket received and never taken is closed with the message")
+untaken_socket_closes()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(send_and_drop(io)).expect("ran")
+    lp.run()
+
+    val before = lowest_free()
+
+    lp.block_on(send_and_drop(io)).expect("ran")
+    lp.run()
+    assert_eq(lowest_free(), before)
+    assert(!io.on_loop().alive(), "nothing was left on the loop")
+
+// -- Refusals --------------------------------------------------------------------------------------
+
+private async refusals(io: &Uv)
+    val (plain, other) = io.socket_pair().expect("a pair")
+    val (one, two) = channel_pair(io)
+    val l = io.listen(loopback(0)).expect("listening")
+
+    // A pipe that is not a channel cannot carry a handle.
+    assert_eq((await plain.write_handle("x".bytes, PassListener(l))).unwrap_err(), libuv.Error(libuv.EINVAL))
+
+    // Nor can a channel carry one with no bytes to attach it to.
+    assert_eq((await one.write_handle([0u8; 0], PassListener(l))).unwrap_err(), libuv.Error(libuv.EINVAL))
+
+    // A plain pipe's read_handles is its read: bytes, and never a handle.
+    (await other.write("plain".bytes)).expect("written")
+
+    val m = (await plain.read_handles()).expect("read")
+
+    assert_eq(text(m.bytes), "plain")
+    assert_eq(m.handles.len, 0)
+
+    // The end of the stream is an empty message.
+    other.close()
+    assert_eq((await plain.read_handles()).expect("read").bytes.len, 0)
+
+    l.close()
+    plain.close()
+    one.close()
+    two.close()
+end refusals
+
+@test("a handle over a plain pipe, or with no bytes, is refused; a plain read_handles is bytes")
+ipc_refusals()
+    val io = uv()
+    val lp = event_loop(io)
+
+    lp.block_on(refusals(io)).expect("ran")
+    lp.run()
+    assert(!io.on_loop().alive(), "everything was closed")
+
+@test("channel on a descriptor that is not open is EBADF")
+channel_bad_descriptor()
+    val io = uv()
+    val lp = event_loop(io)
+
+    assert_eq(io.channel(1000).unwrap_err(), libuv.Error(libuv.EBADF))
+    lp.run()
+    assert(!io.on_loop().alive(), "the refused pipe was closed")
+
+private async read_then_close(lp: &Loop[Uv], ch: &Pipe) -> Result[Message, Error]
+    lp.spawn(close_later(lp, ch))
+    await ch.read_handles()
+
+private async close_later(lp: &Loop[Uv], ch: &Pipe)
+    await lp.sleep(millis(10))
+    ch.close()
+
+@test("closing a channel under read_handles ends it with ECANCELED")
+read_handles_cancelled()
+    val io = uv()
+    val lp = event_loop(io)
+    val (one, two) = channel_pair(io)
+
+    assert_eq(lp.block_on(read_then_close(lp, one)).expect("ran").unwrap_err(), libuv.Error(libuv.ECANCELED))
+    assert_eq(lp.block_on(one.read_handles()).expect("ran").unwrap_err(), libuv.Error(libuv.ECANCELED))
+    two.close()
+    lp.run()
+
+// -- A parent and a child --------------------------------------------------------------------------
+
+// The child is this test binary, run again on this very test: the runner names the test to run as
+// the first argument, `module$function`, and the environment says which side to play.
+private val ROLE: string = "KAIROS_IPC_ROLE"
+private val TEST_KEY: string = "sh.sysl.kairos.uv$listener_to_a_child"
+
+private async child_side(io: &Uv)
+    val ch = io.channel(3).expect("the channel on descriptor 3")
+    val m = (await ch.read_handles()).expect("the listener's message")
+
+    assert_eq(text(m.bytes), "listen")
+    assert_eq(m.handles.len, 1)
+
+    val l = m.handles[0] match
+        PassedSocket(s) -> s.listen().expect("listening on the parent's socket")
+        PassedPipe(_) -> panic("a socket was sent")
+
+    (await ch.write("ready".bytes)).expect("written")
+
+    val conn = (await l.accept()).expect("the parent's client")
+    val asked = (await conn.read()).expect("read")
+
+    (await conn.write(s"pong to ${text(asked)}".bytes)).expect("written")
+    conn.close()
+    l.close()
+    (await ch.write("done".bytes)).expect("written")
+    ch.close()
+end child_side
+
+private async parent_side(io: &Uv, lp: &Loop[Uv]) -> string
+    val l = io.listen(loopback(0)).expect("listening")
+    val port = l.port().expect("a port")
+    val exe = libuv.exepath().expect("this program")
+    val p = io.spawn(exe, [TEST_KEY], env = [s"$ROLE=child"], extra = [Channel]).expect("spawned")
+    val ch = p.pipe(3).expect("a channel")
+
+    (await ch.write_handle("listen".bytes, PassListener(l))).expect("sent")
+
+    // Only the child listens from here on, so a connection accepted at all was accepted there.
+    l.close()
+    assert_eq(text((await ch.read()).expect("read")), "ready")
+
+    val client = (await io.connect(loopback(port))).expect("connected to the child")
+
+    (await client.write("ping".bytes)).expect("written")
+
+    val answer = text((await client.read()).expect("read"))
+
+    client.close()
+    assert_eq(text((await ch.read()).expect("read")), "done")
+    assert_eq((await ch.read()).expect("read").len, 0)
+
+    val e = await p.exit()
+
+    assert_eq(e.status, 0)
+    ch.close()
+    answer
+end parent_side
+
+@test("a parent passes a listening socket to a child on descriptor 3, and the child accepts on it")
+listener_to_a_child()
+    val io = uv()
+    val lp = event_loop(io)
+
+    if libuv.env(ROLE).is_ok()
+        lp.block_on(child_side(io)).expect("ran")
+        lp.run()
+        return
+
+    lp.block_on(lp.timeout(millis(20000), parent_side(io, lp))).expect("ran") match
+        Some(answer) -> assert_eq(answer, "pong to ping")
+        None -> panic("the child did not answer in time")
+
+    lp.run()
+    assert(!io.on_loop().alive(), "the child, its channel and every socket were closed")
+#endif
