@@ -50,9 +50,24 @@ struct Uv
      */
     connect(self, addr: libuv.Address) -> Task[Result[&Connection, Error]] = connect_on(self.lp, addr)
 
-    /** Bind `addr` and start listening. A port of `0` lets the kernel choose; `port()` says which. */
-    listen(self, addr: libuv.Address, backlog: int = 128) -> Result[&Listener, Error] =
-        listen_on(self.lp, addr, backlog)
+    /** Bind `addr` and start listening. A port of `0` lets the kernel choose; `port()` says which.
+     *
+     * Two options, named at the call: `reuse_port` lets several listeners hold one port and has the
+     * kernel share connections across them (`SO_REUSEPORT` with load balancing) -- **refused with
+     * `ENOTSUP` where the kernel does not distribute, macOS included**, so a server that wants the
+     * port either way listens again without it; `ipv6_only` binds a v6 address alone, so a v4 client
+     * is not taken through the v4-mapped addresses, and is `EINVAL` with a v4 address.
+     *
+     *     val l = io.listen(ip4("0.0.0.0", 8080)?, reuse_port = true)?
+     */
+    listen(self, addr: libuv.Address, backlog: int = 128, reuse_port: bool = false,
+           ipv6_only: bool = false) -> Result[&Listener, Error]
+        var flags: u32 = 0
+
+        if reuse_port then flags |= libuv.TCP_REUSEPORT
+        if ipv6_only then flags |= libuv.TCP_IPV6ONLY
+
+        listen_on(self.lp, addr, backlog, flags)
 
     /** A task that reads the whole of the file at `path`. */
     read_file(self, path: string) -> Task[Result[[]u8, Error]] = read_file_on(self.lp, path)
@@ -60,6 +75,16 @@ struct Uv
     /** A task that writes `bytes` as the whole of the file at `path`, creating or truncating it. */
     write_file(self, path: string, bytes: []const u8) -> Task[Result[unit, Error]] =
         write_file_on(self.lp, path, bytes)
+
+    /** A task that appends `bytes` to the file at `path`, creating it if it is not there. */
+    append_file(self, path: string, bytes: []const u8) -> Task[Result[unit, Error]] =
+        append_file_on(self.lp, path, bytes)
+
+    /** Watch `path` for changes, taken one at a time with `next`; `recursive` asks for its
+     * subdirectories too, where the platform can. A path that is not there is `ENOENT`, from this call.
+     */
+    watch(self, path: string, recursive: bool = false) -> Result[&Watch, Error] =
+        watch_on(self.lp, path, recursive)
 
     /** A task that resolves `host` and `service` on libuv's thread pool, ending with every way the
      * resolver found to reach it, in the order it prefers. `flags` takes libuv's `AI_` constants;
@@ -89,14 +114,26 @@ struct Uv
      */
     adopt(self, fd: i32) -> Result[&Pipe, Error] = adopt_on(self.lp, fd)
 
+    /** The ipc channel a parent gave this process at descriptor `fd` -- a `Channel` slot of its
+     * `spawn` -- opened as one, so it carries handles as well as bytes. libuv owns the descriptor
+     * afterwards. `EBADF` for a descriptor that is not open, and a terminal is refused with `EINVAL`.
+     */
+    channel(self, fd: i32) -> Result[&Pipe, Error] = channel_on(self.lp, fd)
+
     /** Start `file` -- looked up on `PATH` unless it holds a slash -- with `args`, which do not
      * include its own name. `env` of `[]` inherits this process's environment, and anything else
-     * replaces it; `cwd` of `""` starts it here. A program that is not there is `ENOENT`, from this
-     * call.
+     * replaces it; `cwd` of `""` starts it here. `env_add` (`NAME=value` entries) is added on top of
+     * whichever environment that gives, replacing a variable of the same name -- so `env_add` alone is
+     * this process's environment plus those. A program that is not there is `ENOENT`, from this call.
+     * `extra` says what the child's descriptors from 3 on are, in order.
      */
     spawn(self, file: string, args: []const string, env: []const string = [], cwd: string = "",
-          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit) -> Result[&Process, Error] =
-        spawn_on(self.lp, file, args, env, cwd, stdin, stdout, stderr)
+          stdin: Stdio = Inherit, stdout: Stdio = Inherit, stderr: Stdio = Inherit,
+          env_add: []const string = [], extra: []const Stdio = []) -> Result[&Process, Error]
+        // Kept alive across the call: the child's environment is a view of it.
+        val merged = merged_env(env, env_add)
+
+        spawn_on(self.lp, file, args, merged.view(), cwd, stdin, stdout, stderr, extra)
 
     /** A task that ends with `signum` at its next arrival, on a watcher of its own. */
     signal(self, signum: i32) -> Task[Result[i32, Error]] = signal_on(self.lp, signum)

@@ -14,21 +14,37 @@ module sh.sysl.kairos.uv
 // exits, and is closed then: a dropped child keeps the loop running as a running one does, and
 // leaves nothing behind once it has gone. What it was piped to closes with it, unless a task still
 // holds the pipe.
+//
+// **A child may have more than three descriptors.** `extra` lists what its descriptors 3, 4, ... are,
+// and `pipe(n)` reaches the pipe at any of them. A `Channel` there is how a parent and a child talk
+// and hand each other sockets: the child opens it with `io.channel(3)`, and `ipc.sysl` has the rest.
+//
+//     val p = io.spawn(exe, ["--worker"], extra = [Channel])?
+//     val ch = p.pipe(3).expect("a channel")
+//     (await ch.write_handle("listen".bytes, PassListener(l)))?
 
 import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 import sysl.buf.{Buf, buf}
+import sysl.env.vars
 
-/** What one of the child's standard streams is. */
+/** What one of the child's descriptors is. */
 enum Stdio
     /** This process's own descriptor of the same number, which is what a shell does. */
     Inherit
 
-    /** A pipe, whose other end is `stdin()`, `stdout()` or `stderr()` on the `Process`. */
+    /** A pipe, whose other end is `stdin()`, `stdout()`, `stderr()` or `pipe(n)` on the `Process`.
+     * Past the first three it goes both ways.
+     */
     Piped
 
     /** Nothing: a read is the end of the stream at once, and a write goes nowhere. */
     Ignore
+
+    /** An ipc pipe, both ways: bytes, and sockets and pipes sent beside them with `write_handle`
+     * and taken with `read_handles`. The child opens its end with `io.channel(fd)`.
+     */
+    Channel
 
 /** How a child ended: its exit status, or the signal that ended it -- one of the two is zero. */
 struct Exit
@@ -40,9 +56,7 @@ struct Process
     private child: &libuv.Process
     private ended: Option[Exit]
     private waiter: Option[&Pending[unit]]
-    private input: Option[&Pipe]
-    private output: Option[&Pipe]
-    private errors: Option[&Pipe]
+    private pipes: []Option[&Pipe]
 
     /** The child's process id. */
     pid(self) -> i32
@@ -61,13 +75,16 @@ struct Process
         Ok(c.kill(signum)?)
 
     /** The pipe to the child's standard input, if it was `Piped`. Closing it is the end of the input. */
-    stdin(self) -> Option[&Pipe] = self.input
+    stdin(self) -> Option[&Pipe] = self.pipe(0)
 
     /** The pipe from the child's standard output, if it was `Piped`. */
-    stdout(self) -> Option[&Pipe] = self.output
+    stdout(self) -> Option[&Pipe] = self.pipe(1)
 
     /** The pipe from the child's standard error, if it was `Piped`. */
-    stderr(self) -> Option[&Pipe] = self.errors
+    stderr(self) -> Option[&Pipe] = self.pipe(2)
+
+    /** The pipe at the child's descriptor `fd`, if that one was `Piped` or a `Channel`. */
+    pipe(self, fd: int) -> Option[&Pipe] = if fd < 0 || fd >= int(self.pipes.len) then None else self.pipes[fd]
 
     /** A task that ends when the child has exited, with how it ended -- at once if it already has.
      * One task waits at a time; dropping it leaves the child running.
@@ -91,17 +108,22 @@ private[uv] close_handle[H: Handle](h: &H)
     if !h.is_closing() then h.close()
 
 private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: []const string,
-                     cwd: string, stdin: Stdio, stdout: Stdio, stderr: Stdio) -> Result[&Process, Error]
+                     cwd: string, stdin: Stdio, stdout: Stdio, stderr: Stdio,
+                     extra: []const Stdio) -> Result[&Process, Error]
     var slots: Buf[libuv.Stdio] = buf()
+    var pipes: Buf[Option[&Pipe]] = buf()
+    val both = libuv.READABLE_PIPE | libuv.WRITABLE_PIPE
 
     // Each pipe is a `Pipe` from the start, so one that a failed spawn leaves behind is closed as it
     // is dropped.
-    val input = slot(lp, stdin, 0, libuv.READABLE_PIPE, slots)?
-    val output = slot(lp, stdout, 1, libuv.WRITABLE_PIPE, slots)?
-    val errors = slot(lp, stderr, 2, libuv.WRITABLE_PIPE, slots)?
+    pipes.push(slot(lp, stdin, 0, libuv.READABLE_PIPE, slots)?)
+    pipes.push(slot(lp, stdout, 1, libuv.WRITABLE_PIPE, slots)?)
+    pipes.push(slot(lp, stderr, 2, libuv.WRITABLE_PIPE, slots)?)
+
+    for i in 0..<extra.len do pipes.push(slot(lp, extra[i], i32(i + 3), both, slots)?)
 
     val child = libuv.spawn(file, args, ignore_exit, slots.view(), cwd, env, 0, lp)?
-    var p: &Process = Process(child, None, None, input, output, errors)
+    var p: &Process = Process(child, None, None, pipes.view())
 
     // Weak, or the handle -- which the loop holds until it is closed -- would hold the process, and a
     // process nobody holds any more would never go. Once it has, the exit closes the handle alone.
@@ -114,9 +136,44 @@ private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: [
     Ok(p)
 end spawn_on
 
+// The environment a child is given: `env` (or this process's, where `env` is empty) with each `NAME=value`
+// of `add` replacing the entry of that name or joining the end. Empty when neither is given, which
+// spawn reads as "inherit".
+private[uv] merged_env(env: []const string, add: []const string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    if env.len == 0 && add.len == 0 then return out
+
+    if env.len > 0
+        for e in env do out.push(e)
+    else
+        for v in vars() do out.push(v.0 + "=" + v.1)
+
+    for a in add
+        val name = name_of(a)
+        var at: Option[usize] = None
+
+        for i in 0..<out.len()
+            if name_of(out.at(i)) == name then at = Some(i)
+
+        at match
+            Some(i) -> out.set(i, a)
+            None -> out.push(a)
+
+    out
+end merged_env
+
+// The part of a `NAME=value` entry before its first `=`; the whole entry where there is none.
+private name_of(entry: string) -> string
+    for i in 0..<entry.len
+        if entry[i] == u8('=') then return entry[0..<i]
+
+    entry
+
 private ignore_exit(status: i64, signal: i32) -> unit = ()
 
-// One of the child's descriptors. `flags` is the pipe's direction from the child's side.
+// One of the child's descriptors. `flags` is the pipe's direction from the child's side; a channel
+// goes both ways wherever it is.
 private slot(lp: &libuv.Loop, s: Stdio, fd: i32, flags: i32, slots: Buf[libuv.Stdio]) -> Result[Option[&Pipe], Error]
     s match
         Inherit ->
@@ -129,6 +186,11 @@ private slot(lp: &libuv.Loop, s: Stdio, fd: i32, flags: i32, slots: Buf[libuv.St
             val p = libuv.pipe(false, lp)?
 
             slots.push(libuv.ToPipe(p, flags))
+            Ok(Some(piped(p)))
+        Channel ->
+            val p = libuv.pipe(true, lp)?
+
+            slots.push(libuv.ToPipe(p, libuv.READABLE_PIPE | libuv.WRITABLE_PIPE))
             Ok(Some(piped(p)))
 end slot
 
