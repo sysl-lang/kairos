@@ -24,6 +24,42 @@ host_sleeps_take_real_time()
     assert(took < 1000)
 end host_sleeps_take_real_time
 
+private struct Fires
+    n: int
+
+@test("on the host driver a background five-second timer does not hold run, which returns at once")
+host_background_timer_does_not_hold()
+    val lp = event_loop(host())
+    val f: &Fires = Fires(0)
+    val t =lp.after(millis(5000), (l) -> f.n += 1)
+    val started = monotonic()
+
+    t.background()
+    lp.run()
+
+    val took = whole_micros(monotonic() - started) / 1000
+
+    assert(took < 1000, s"run returned promptly: $took ms")
+    assert_eq(f.n, 0)
+end host_background_timer_does_not_hold
+
+@test("on the host driver a background periodic timer fires on time while a kept sleep holds the loop")
+host_background_fires_while_held()
+    val lp = event_loop(host())
+    val f: &Fires = Fires(0)
+    val started = monotonic()
+
+    lp.every(millis(10), (l) -> f.n += 1).background()
+    lp.block_on(lp.sleep(millis(55))).expect("nothing stops this loop")
+
+    val took = whole_micros(monotonic() - started) / 1000
+
+    // 10 through 50, and 60 only where the wake at 55 came late enough to find it due as well.
+    assert(f.n == 5 || f.n == 6, s"fired at each period: ${f.n}")
+    assert(took >= 55 && took < 1000, s"held by the sleep alone: $took ms")
+    assert(!lp.alive())
+end host_background_fires_while_held
+
 private struct Raiser
     r: Remote
     w: Waker

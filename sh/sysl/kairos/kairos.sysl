@@ -118,10 +118,23 @@ private struct Flag
 
 /** The loop's count of tasks parked on a notifier: `held` ones keep it alive and `quiet` ones do not,
  * but stop `run` cancelling what is parked when it ends.
+ *
+ * It also holds which live timers are in the background, by timer slot, and how many there are, so
+ * `alive` can leave them out: a `Timer` reaches its mark through the box without the loop.
  */
 private struct Keeps
     held: usize
     quiet: usize
+    timers: usize
+    marks: Buf[Mark]
+
+/** One timer slot's background mark: the generation of the timer in it, whether that timer is still
+ * pending, and whether it is in the background.
+ */
+private struct Mark
+    gen: u32
+    live: bool
+    quiet: bool
 
 /** Wakes one notifier from any thread. It is a value: copy it to as many threads as wake it.
  *
@@ -250,10 +263,43 @@ enum SourceError
     OutOfRange(n: u32)
     Taken(n: u32)
 
-/** A timer, as `after` and `every` answer it: the thing `cancel` takes. */
+/** A timer, as `after` and `every` answer it: the thing `cancel` takes.
+ *
+ * **A pending timer keeps the loop alive, unless it is put in the `background`**, which is node's
+ * `timer.unref()`: `run` then ends when only background timers are left, and a background timer
+ * still fires, one-shot or periodic, on every pass the loop runs for other reasons. `keep` undoes it,
+ * node's `timer.ref()`. Either may be called again to no effect, and on a timer that has fired or
+ * been cancelled does nothing.
+ */
 struct Timer
     private slot: u32
     private gen: u32
+    private keeps: &Keeps
+
+    /** Stop counting this timer as something that keeps the loop alive. */
+    background(self)
+        if !self.pending() || self.keeps.marks[usize(self.slot)].quiet then return
+
+        self.keeps.marks[usize(self.slot)].quiet = true
+        self.keeps.timers += 1
+    end background
+
+    /** Count it again, as a timer is when it is set. */
+    keep(self)
+        if !self.pending() || !self.keeps.marks[usize(self.slot)].quiet then return
+
+        self.keeps.marks[usize(self.slot)].quiet = false
+        self.keeps.timers -= 1
+    end keep
+
+    /** Whether it is pending and in the background. */
+    is_background(self) -> bool = self.pending() && self.keeps.marks[usize(self.slot)].quiet
+
+    // Whether the timer this value names has neither fired (a one-shot) nor been cancelled.
+    private pending(self) -> bool
+        val m = self.keeps.marks[usize(self.slot)]
+        m.live && m.gen == self.gen
+end Timer
 
 /** An idle or check handle, as `idle` and `check` answer it: the thing `remove` takes. */
 struct Handle
@@ -443,7 +489,7 @@ struct Loop[D: Driver]
     /** Cancel a timer. Answers whether it was still pending; a one-shot that has fired, or a timer
      * already cancelled, answers false. A timer may cancel itself, or any other, from a callback.
      */
-    cancel(*self, t: Timer) -> bool = self.timers.remove(t.slot, t.gen)
+    cancel(*self, t: Timer) -> bool = self.unset(t.slot, t.gen)
 
     /** Run `cb` on every pass, and never sleep while it exists: for work that must be polled as fast
      * as the machine allows.
@@ -484,12 +530,12 @@ struct Loop[D: Driver]
     stop(*self)
         self.stopping = true
 
-    /** Whether anything is left that could ever run: a timer, a handle, a source registered or
+    /** Whether anything is left that could ever run: a timer not in the background, a handle, a source registered or
      * raised, a notifier woken, a woken task, a task waiting on a notifier not in the background, or
      * work the driver holds.
      */
     alive(self) -> bool
-        if self.registered != 0 || self.timers.live > 0 || self.keeps.held > 0 then return true
+        if self.registered != 0 || self.timers.live > self.keeps.timers || self.keeps.held > 0 then return true
         if self.idles.live > 0 || self.checks.live > 0 || !self.ready.woken.is_empty() then return true
         if self.raised() then return true
 
@@ -694,8 +740,21 @@ struct Loop[D: Driver]
 
     private schedule(*self, delay: Duration, period: Option[Duration], cb: Callback[D]) -> Timer
         val (slot, gen) = self.timers.add(TimerState(cb, period))
+        val m = Mark(gen, true, false)
+
+        if usize(slot) == self.keeps.marks.len() then self.keeps.marks.push(m) else self.keeps.marks[usize(slot)] = m
         self.enqueue(self.time + delay, slot, gen)
-        Timer(slot, gen)
+        Timer(slot, gen, self.keeps)
+    end schedule
+
+    // Remove a pending timer and take it out of the background count; false for one already gone.
+    private unset(*self, slot: u32, gen: u32) -> bool
+        if !self.timers.remove(slot, gen) then return false
+
+        if self.keeps.marks[usize(slot)].quiet then self.keeps.timers -= 1
+        self.keeps.marks[usize(slot)] = Mark(gen, false, false)
+        true
+    end unset
 
     private enqueue(*self, at: Duration, slot: u32, gen: u32)
         self.queue.push(Due(at, self.seq, slot, gen))
@@ -720,7 +779,7 @@ struct Loop[D: Driver]
                 Some(t) ->
                     t.period match
                         Some(p) -> self.enqueue(due.at + p, due.slot, due.gen)
-                        None -> self.timers.remove(due.slot, due.gen)
+                        None -> self.unset(due.slot, due.gen)
 
                     t.cb(self)
                 None -> ()
@@ -820,4 +879,4 @@ end Loop
  */
 event_loop[D: Driver](driver: &D) -> &Loop[D] =
     Loop(driver, [None; 32], 0, slots(), heap(), 0, slots(), slots(), slots(), Ready(buf()), buf(),
-        driver.now(), false, None, buf(), Keeps(0, 0))
+        driver.now(), false, None, buf(), Keeps(0, 0, 0, buf()))

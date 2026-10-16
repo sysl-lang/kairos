@@ -1,0 +1,188 @@
+module sh.sysl.kairos.sim
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.time.{millis, whole_micros}
+import sh.sysl.kairos.{Loop, event_loop}
+
+/** Background timers on the simulated driver: a timer in the background keeps nothing alive but
+ * still fires while something else does, `keep` holds the loop again, and the background count stays
+ * right through a second call, a cancel, a one-shot firing and a slot reused by a later timer.
+ */
+
+private struct Hits
+    n: int
+    at: Buf[long]
+
+private hits() -> &Hits = Hits(0, buf())
+
+private ms(lp: *Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private ms(lp: &Loop[Sim]) -> long = whole_micros(lp.now()) / 1000
+
+private hit(h: &Hits, lp: *Loop[Sim])
+    h.n += 1
+    h.at.push(ms(lp))
+
+@test("a background timer alone does not keep the loop: run returns at once and it never fires")
+background_timer_alone_ends_run()
+    val lp = event_loop(sim())
+    val h = hits()
+    val t = lp.after(millis(5000), (l) -> hit(h, l))
+
+    assert(!t.is_background())
+    t.background()
+    assert(t.is_background())
+    assert(!lp.alive())
+
+    lp.run()
+
+    assert_eq(whole_micros(lp.now()), 0)
+    assert_eq(h.n, 0)
+    assert(t.is_background(), "still pending, only not waited for")
+    assert(lp.cancel(t))
+end background_timer_alone_ends_run
+
+@test("a background timer still fires, one-shot and periodic, while a kept timer holds the loop")
+background_fires_while_kept_timer_holds()
+    val lp = event_loop(sim())
+    val one = hits()
+    val many = hits()
+
+    lp.after(millis(10), (l) -> hit(one, l)).background()
+    val e = lp.every(millis(10), (l) -> hit(many, l))
+    e.background()
+    lp.after(millis(45), (l) -> ())
+    lp.run()
+
+    assert_eq(ms(lp), 45)
+    assert_eq(one.at.view(), [10])
+    assert_eq(many.at.view(), [10, 20, 30, 40])
+    assert(!lp.alive(), "the background every is left, pending")
+    assert(e.is_background())
+    assert(lp.cancel(e))
+    assert(!e.is_background())
+end background_fires_while_kept_timer_holds
+
+private async wait_source(lp: &Loop[Sim], n: u32, log: &Buf[long])
+    await lp.wait_for(n)
+    log.push(whole_micros(lp.now()) / 1000)
+
+@test("a background timer fires while a task waiting on a source holds the loop, and run ends with it")
+background_fires_while_source_holds()
+    val s = sim()
+    val lp = event_loop(s)
+    val h = hits()
+    val log: &Buf[long] = buf()
+
+    lp.every(millis(10), (l) -> hit(h, l)).background()
+    lp.spawn(wait_source(lp, 3, log))
+    s.irq_at(millis(25), 3)
+    lp.run()
+
+    assert_eq(log.view(), [25])
+    assert_eq(h.at.view(), [10, 20])
+    assert_eq(lp.running(), 0)
+end background_fires_while_source_holds
+
+@test("keep after background holds the loop again, and both are idempotent")
+keep_after_background_holds()
+    val lp = event_loop(sim())
+    val h = hits()
+    val t = lp.after(millis(50), (l) -> hit(h, l))
+
+    t.background()
+    t.background()
+    assert(t.is_background())
+    t.keep()
+    t.keep()
+    assert(!t.is_background())
+    assert(lp.alive())
+
+    lp.run()
+
+    assert_eq(h.at.view(), [50])
+    assert(!lp.alive())
+end keep_after_background_holds
+
+@test("a background one-shot that fired leaves the count right: background and keep on it do nothing")
+fired_background_leaves_counts_right()
+    val lp = event_loop(sim())
+    val h = hits()
+    val t = lp.after(millis(10), (l) -> hit(h, l))
+
+    t.background()
+    lp.after(millis(20), (l) -> ())
+    lp.run()
+
+    assert_eq(h.at.view(), [10])
+    assert(!t.is_background(), "fired, so no longer pending")
+    t.keep()
+    t.background()
+    t.keep()
+    assert(!t.is_background())
+    assert(!lp.alive(), "a keep on a fired timer did not count anything")
+
+    // Neither under- nor overcounted: a fresh kept timer holds the loop and fires.
+    lp.after(millis(5), (l) -> hit(h, l))
+    assert(lp.alive())
+    lp.run()
+
+    assert_eq(h.at.view(), [10, 25])
+    assert(!lp.alive())
+end fired_background_leaves_counts_right
+
+@test("cancelling a background timer leaves the count right, and its stale value never reaches the slot's next timer")
+cancelled_background_leaves_counts_right()
+    val lp = event_loop(sim())
+    val h = hits()
+    val t = lp.after(millis(10), (l) -> hit(h, l))
+
+    t.background()
+    assert(lp.cancel(t))
+    assert(!lp.cancel(t))
+    assert(!t.is_background())
+    t.keep()
+    assert(!lp.alive())
+
+    // The next timer reuses the slot; the cancelled one's background must not reach it.
+    val u = lp.after(millis(30), (l) -> hit(h, l))
+
+    t.background()
+    assert(!u.is_background())
+    assert(lp.alive())
+
+    u.background()
+    assert(!lp.alive())
+    t.keep()
+    assert(u.is_background(), "the stale value's keep did not reach it either")
+    assert(!lp.alive())
+
+    u.keep()
+    lp.run()
+
+    assert_eq(h.at.view(), [30])
+    assert(!lp.alive())
+end cancelled_background_leaves_counts_right
+
+@test("a periodic background timer kept from one callback and cancelled from another")
+background_changed_from_callbacks()
+    val lp = event_loop(sim())
+    val h = hits()
+    val e = lp.every(millis(10), (l) -> hit(h, l))
+
+    e.background()
+    // At 15 the periodic one is kept, so it holds the loop until it cancels itself at its fourth.
+    lp.after(millis(15), (l) -> e.keep())
+    val stop = hits()
+    val tick = lp.every(millis(10), (l) ->
+        stop.n += 1
+        if stop.n == 4 then l.cancel(e))
+
+    tick.background()
+    lp.run()
+
+    assert_eq(h.at.view(), [10, 20, 30, 40])
+    assert_eq(ms(lp), 40)
+    assert(!lp.alive())
+end background_changed_from_callbacks

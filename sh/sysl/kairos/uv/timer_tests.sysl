@@ -1,0 +1,69 @@
+module sh.sysl.kairos.uv
+#if feature_uv
+@requires(posix)
+@tests
+
+// Background timers through the libuv driver. A kairos timer is the loop's own, not a libuv handle:
+// the driver's one `uv_timer` is started for a wait and stopped after it, so it never holds libuv's
+// loop alive, and whether the kairos loop is alive is the loop's count, which leaves a background
+// timer out.
+
+import sh.sysl.kairos.{Driver, Loop, event_loop}
+import sysl.buf.{Buf, buf}
+import sysl.time.{Duration, millis, whole_micros}
+import sysl.posix.time.monotonic
+
+private elapsed_ms(from: Duration) -> long = whole_micros(monotonic() - from) / 1000
+
+private struct Ticks
+    at: Buf[long]
+
+@test("through uv, a background five-second timer does not hold run, which returns at once")
+uv_background_timer_does_not_hold()
+    val io = uv()
+    val lp = event_loop(io)
+    val k: &Ticks = Ticks(buf())
+    val t = lp.after(millis(5000), (l) -> k.at.push(5000))
+    val started = monotonic()
+
+    t.background()
+    lp.run()
+
+    assert(elapsed_ms(started) < 1000, s"run returned promptly: ${elapsed_ms(started)} ms")
+    assert_eq(k.at.len(), 0)
+    assert(!io.busy(), "nothing of libuv's is left holding its loop")
+    assert(lp.cancel(t))
+    io.close()
+end uv_background_timer_does_not_hold
+
+private async held(lp: &Loop[Uv], ms: long) = await lp.sleep(millis(ms))
+
+@test("through uv, background timers fire, one-shot and periodic, while a kept sleep holds the loop, and keep holds it again")
+uv_background_fires_while_held()
+    val io = uv()
+    val lp = event_loop(io)
+    val k: &Ticks = Ticks(buf())
+    val started = monotonic()
+
+    lp.after(millis(10), (l) -> k.at.push(1)).background()
+    val e = lp.every(millis(15), (l) -> k.at.push(2))
+    e.background()
+    lp.block_on(held(lp, 40)).expect("nothing stops this loop")
+
+    assert(k.at.len() >= 3, s"the one-shot and the periodic one fired: ${k.at.len()}")
+    assert_eq(k.at[0], 1)
+    assert(!lp.alive(), "the background every alone is left")
+
+    // Kept again, the periodic timer holds run until it is cancelled from a callback.
+    val before = k.at.len()
+
+    e.keep()
+    lp.after(millis(50), (l) -> l.cancel(e)).background()
+    lp.run()
+
+    assert(k.at.len() - before >= 2, s"it ran while it was kept: ${k.at.len() - before}")
+    assert(elapsed_ms(started) < 1000, s"${elapsed_ms(started)} ms")
+    assert(!lp.alive())
+    io.close()
+end uv_background_fires_while_held
+#endif

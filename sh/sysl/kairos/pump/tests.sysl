@@ -204,6 +204,28 @@ timer_ends_the_wait()
     assert_eq(watchers.load(), 0, "the host driver has no descriptor to watch")
 end timer_ends_the_wait
 
+@test("a background timer neither holds the pumped loop nor is lost: run returns at once, and it fires beside a kept one")
+background_timer_through_the_pump()
+    val p = pipe_pump(true)
+    val lp = event_loop(pumped(host(), p))
+    val log: &Buf[long] = buf()
+    val t = lp.after(millis(5000), (l) -> log.push(5000))
+    val started = monotonic()
+
+    t.background()
+    lp.run()
+
+    assert(ms_since(started) < 1000, s"run returned promptly: ${ms_since(started)} ms")
+    assert_eq(p.waits, 0, "nothing was waited for")
+    assert(lp.cancel(t))
+
+    lp.after(millis(10), (l) -> log.push(10)).background()
+    lp.block_on(lp.sleep(millis(30))).expect("the sleep ends")
+
+    assert_eq(log.view(), [10])
+    assert(!lp.alive())
+end background_timer_through_the_pump
+
 @test("an event arriving on the pump from another thread wakes the task waiting for it, in the same wait")
 pump_event_wakes_a_task()
     val box: &Buf[&Notifier] = buf()

@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.8" }
 }
 ```
 
@@ -59,6 +59,7 @@ passes: 5
 | `ev.on(n, cb)` / `ev.off(n)` | the handler for source `n`; `on` answers `Err(OutOfRange(n))` or `Err(Taken(n))` |
 | `ev.after(d, cb)` / `ev.every(d, cb)` | a one-shot or repeating timer, answering a `Timer` |
 | `ev.cancel(t)` | cancel a timer; answers whether it was still pending |
+| `t.background()` / `t.keep()` | stop and start counting a pending timer as keeping the loop alive — node's `timer.unref()` and `timer.ref()` |
 | `ev.idle(cb)` / `ev.check(cb)` / `ev.remove(h)` | handles that run on every pass |
 | `ev.run()` / `ev.stop()` / `ev.now()` | run until stopped or until nothing is left; the pass's time |
 
@@ -81,6 +82,12 @@ none.
   deadline back.
 - **A timer set during a pass fires on a later pass**, even at a delay of zero, so a callback cannot
   keep a pass from ending. A timer may cancel itself or any other from a callback.
+- **A timer in the background keeps nothing alive** — node's `timer.unref()`. `run` ends when only
+  background timers are left, and leaves them pending; while the loop runs for anything else they
+  fire as any timer does, one-shot or periodic. `t.keep()` counts it again; either call is idempotent,
+  and on a timer that has fired or been cancelled does nothing. A timer is the loop's own on every
+  driver — the `uv` driver's one `uv_timer` runs only for the length of a wait — so it is the same
+  everywhere.
 - **An out-of-range source number** is refused at run time by `on` with `OutOfRange`, and ignored by
   `signal`, which has nobody to refuse it to. A source is a bit of a 32-bit word and sysl has no
   type to make the bound a compile-time one without costing every call site a constructor.
@@ -223,6 +230,7 @@ and reaches that loop and no other:
 | `lp.remote(k)` | a `Remote` whose `raise()` raises source `k` of this loop — not the process's — and ends its wait; `Err(OutOfRange(k))` past 31 |
 | `n.background()`, `n.keep()` | stop and start counting a task waiting in `next` as keeping the loop alive; either may be called while it waits |
 | `s.background()`, `s.keep()` | the same for a `uv` signal watcher, which is node's rule for a signal handler |
+| `t.background()`, `t.keep()` | the same for a `Timer` ([above](#what-v01-is)), node's `timer.unref()` |
 
 **Wakes coalesce**: any number of them before a `next` takes them are one, so the task woken goes and
 looks at whatever the other threads left behind — a mailbox — rather than counting. One task waits
@@ -335,7 +343,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.8", features = [uv] }
 }
 ```
 
@@ -503,6 +511,10 @@ parked rather than cancelled, and no cross-talk between notifiers or loops; on t
 a real thread; and on the `uv` driver with 1,024 loops on 1,024 threads, each woken alone and in turn,
 with the process's processor time measured while all of them wait — and a loop waiting only on another
 thread counted at a handful of passes in 300 ms, where the old one-millisecond slice made hundreds.
+Background timers are checked on the simulated driver for a run that ends at once beside one, one-shot
+and periodic ones firing while a kept timer or a source wait holds the loop, `keep` holding it again,
+and the count through a second call, a fire, a cancel and a slot reused by a later timer; and on the
+host, pumped and `uv` drivers for a five-second background timer that `run` returns past at once.
 The composed driver runs over a pipe pump — `wait` is `poll(2)` on a pipe, the waker writes a byte —
 so it needs no window: an inactive pump leaves the simulated driver's waits exactly as they were and
 is never asked; an active one is ended on time by a kairos timer, by an event arriving on the pump, by
