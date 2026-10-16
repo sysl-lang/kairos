@@ -1,0 +1,199 @@
+module sh.sysl.kairos.pump
+@requires(posix)
+@tests
+#if feature_uv
+
+// The composed driver over the `uv` driver and a pipe pump. With the pump active, libuv is never run
+// by a wait of its own: everything it does reaches the loop through the watcher, which polls libuv's
+// backend descriptor and wakes the pump. Each case is held to the two ways that can go wrong: a stall
+// -- every wait is capped at two seconds by a kairos timeout, and reaching it fails -- and a spin,
+// caught by counting the pump's waits.
+
+import sh.sysl.libuv
+import sh.sysl.libuv.{Handle, ip4}
+import sh.sysl.kairos.{Loop, event_loop}
+import sh.sysl.kairos.uv.{Listener, Uv, uv}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.threads.spawn
+import sysl.time.{Duration, millis}
+import sysl.posix.time.{monotonic, sleep}
+
+private const cap_ms: long = 2000
+
+private local(port: int) -> libuv.Address = ip4("127.0.0.1", port).expect("a loopback address")
+
+// How many of the pump's waits had no limit nearer than a second: a wait like that which ended within
+// the test's few milliseconds was ended by a wake, which over the `uv` driver is the watcher's.
+private long_waits(p: &PipePump) -> int
+    var n = 0
+
+    for i in 0..<p.timeouts.len()
+        p.timeouts[i] match
+            Some(t) -> if t >= millis(1000) then n += 1
+            None -> n += 1
+
+    n
+end long_waits
+
+// The server takes 30 ms over its answer, on libuv's pool, so the client's read waits on the socket
+// with no timer near.
+private async echo_once(io: &Uv, l: &Listener)
+    val conn = (await l.accept()).expect("a connection")
+    val got = (await conn.read()).expect("bytes")
+
+    (await io.work(() -> slow_seven())).expect("the pause")
+
+    (await conn.write(got)).expect("written back")
+    conn.close()
+    l.close()
+
+private async ask(io: &Uv, port: int, message: string) -> string
+    val conn = (await io.connect(local(port))).expect("connected")
+
+    (await conn.write(message.bytes)).expect("written")
+
+    val reply = (await conn.read()).expect("the echo")
+
+    conn.close()
+    from_utf8_lossy(reply)
+end ask
+
+// A TCP echo under a two-second cap, over `io` composed with `p`.
+private echo(io: &Uv, p: &PipePump) -> string
+    val lp = event_loop(pumped(io, p))
+    val l = io.listen(local(0)).expect("listening")
+    val port = l.port().expect("a port")
+
+    lp.spawn(echo_once(io, l))
+
+    val reply = lp.block_on(lp.timeout(millis(cap_ms), ask(io, port, "through the watcher"))).expect("ran")
+
+    lp.run()
+    reply.expect("the echo came back before the cap: the loop did not stall")
+end echo
+
+@test("over uv, a TCP echo runs through the watcher alone: no stall, no spin, and the watcher joined")
+tcp_echo_through_the_watcher()
+    val p = pipe_pump(true)
+    val started = monotonic()
+
+    assert_eq(echo(uv(), p), "through the watcher")
+    assert(ms_since(started) < 1000, "woken by the watcher, not the cap")
+    assert(p.waits < 40, s"a spin would wait thousands of times: ${p.waits}")
+    assert(long_waits(p) >= 1, "at least one wait had no limit and ended on the watcher's wake")
+    assert_eq(watchers.load(), 0, "the dropped driver joined its watcher")
+end tcp_echo_through_the_watcher
+
+private file_read(io: &Uv, p: &PipePump) -> usize
+    val lp = event_loop(pumped(io, p))
+    val got = lp.block_on(lp.timeout(millis(cap_ms), io.read_file("/etc/hosts"))).expect("ran")
+
+    got match
+        Some(Ok(bytes)) -> bytes.len
+        Some(Err(e)) -> panic(s"read failed: $e")
+        None -> panic("the read stalled: nothing woke the pump when libuv's pool finished")
+end file_read
+
+// A small file is often read before the loop has to wait at all, so this one holds the read to
+// finishing, not to how; the job below is what makes the pump wait on libuv's pool.
+@test("over uv, a file read on libuv's thread pool finishes with the pump active")
+file_read_with_the_pump_active()
+    val p = pipe_pump(true)
+    val started = monotonic()
+
+    assert(file_read(uv(), p) > 0)
+    assert(ms_since(started) < 1000, "not held to the cap")
+    assert(p.waits < 40, s"no spin: ${p.waits} waits")
+    assert_eq(watchers.load(), 0)
+end file_read_with_the_pump_active
+
+private slow_seven() -> int
+    sleep(millis(30))
+    7
+
+private pool_job(io: &Uv, p: &PipePump) -> int
+    val lp = event_loop(pumped(io, p))
+
+    lp.block_on(lp.timeout(millis(cap_ms), io.work(() -> slow_seven()))).expect("ran") match
+        Some(Ok(n)) -> n
+        Some(Err(e)) -> panic(s"the job failed: $e")
+        None -> panic("the job stalled: nothing woke the pump when libuv's pool finished")
+end pool_job
+
+@test("over uv, a 30 ms job on libuv's thread pool ends the pump's wait through the watcher alone")
+pool_job_through_the_watcher()
+    val p = pipe_pump(true)
+    val started = monotonic()
+
+    assert_eq(pool_job(uv(), p), 7)
+
+    val took = ms_since(started)
+
+    assert(took >= 29 && took < 1000, s"woken by the watcher when the job ended, not the cap: $took ms")
+    assert(p.waits >= 1 && p.waits < 10, s"neither a stall nor a spin: ${p.waits} waits")
+    assert(long_waits(p) >= 1, "a wait with no near limit ended on the watcher's wake")
+    assert_eq(watchers.load(), 0, "the dropped driver joined its watcher")
+end pool_job_through_the_watcher
+
+@test("over uv, a libuv timer -- which kairos cannot see -- bounds the pump's wait through backend_timeout")
+libuv_timer_bounds_the_wait()
+    val io = uv()
+    val p = pipe_pump(true)
+    val lp = event_loop(pumped(io, p))
+    val fired: &Buf[long] = buf()
+    val started = monotonic()
+    val t = libuv.timer(io.on_loop()).expect("a timer")
+
+    t.start(30, 0, () -> fired.push(ms_since(started))).expect("started")
+    lp.run()
+
+    assert_eq(fired.len(), 1)
+    assert(fired[0] >= 29 && fired[0] < 1000, s"on time: ${fired[0]} ms")
+    assert(p.waits >= 1 && p.waits < 10, s"one wait or so: ${p.waits}")
+
+    p.timeouts[0] match
+        Some(d) -> assert(d > millis(20) && d <= millis(31), "libuv's timer set the limit")
+        None -> assert(false, "the first wait was bounded by libuv's timer")
+
+    t.close()
+    io.poll()
+end libuv_timer_bounds_the_wait
+
+@test("over uv, a loop remote raised from another thread ends the pump's wait: the driver's waker is both")
+uv_remote_through_the_watcher()
+    val p = pipe_pump(true)
+    val lp = event_loop(pumped(uv(), p))
+    val r = lp.remote(9).expect("in range")
+
+    var s = Later(30, -1, 0, () -> r.raise())
+    val started = monotonic()
+    val t = spawn(&later, &s).unwrap()
+
+    val got = lp.block_on(lp.timeout(millis(cap_ms), lp.wait_for(9))).expect("ran")
+
+    assert(t.join())
+    assert(got.is_some(), "the source was raised")
+    assert(ms_since(started) < 1000)
+end uv_remote_through_the_watcher
+
+@test("over uv with an inactive pump, timers and a TCP echo behave as on uv alone, and the pump is never asked")
+inactive_over_uv()
+    val io = uv()
+    val p = pipe_pump(false)
+    val lp = event_loop(pumped(io, p))
+    val order: &Buf[long] = buf()
+
+    lp.after(millis(30), (l) -> order.push(30))
+    lp.after(millis(10), (l) -> order.push(10))
+    lp.after(millis(20), (l) -> order.push(20))
+    lp.run()
+
+    assert_eq(order.view(), [10, 20, 30])
+    assert_eq(echo(io, p), "through the watcher")
+    assert_eq(p.waits, 0)
+    assert_eq(p.polls, 0)
+    assert_eq(watchers.load(), 0)
+    assert(!io.on_loop().alive(), "the echo closed everything it opened")
+end inactive_over_uv
+#endif

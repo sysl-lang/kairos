@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7" }
 }
 ```
 
@@ -171,6 +171,45 @@ and libuv says so by answering zero, so the embedder passes again at once rather
 it. The `uv` driver answers `None` rather than libuv's zero for a libuv loop
 with nothing alive, which would otherwise spin the embedder.
 
+## Two sources that each want to block: `sh.sysl.kairos.pump`
+
+A program with a window on screen and a task reading a file waits on libuv *and* on the window
+system's event queue, and each of those blocks the thread in its own wait that cannot see the other's
+wake-ups. `sh.sysl.kairos.pump` composes them. The toolkit supplies a **pump** — its wait, with a
+wake another thread can send — and the loop is built over `pumped(inner, pump)`:
+
+```sysl
+val lp = event_loop(pumped(uv(), my_pump()))
+```
+
+| | |
+|---|---|
+| `trait Pump` | `active()`: anything to wait on now (a window open); `wait(timeout: Option[Duration])`: block until events, a wake or the timeout, and route what arrived; `poll()`: route what has arrived without waiting; `busy()`: holds work a task waits on (default false); `waker()`: a `&sync Fn() -> unit` that ends a wait from any thread |
+| `pumped(inner, pump)` | a `&Pumped[D, P]`, a `Driver`: the inner driver's clock; busy if either is; while the pump is **inactive**, exactly the inner driver |
+| `d.remote(k)` | a `PumpRemote` whose `raise()` is `signal(k)` and then the driver's wake; `Err(OutOfRange(k))` past 31 |
+
+**While the pump is active, every wait is the pump's**, bounded by the loop's next timer and the inner
+driver's `backend_timeout`, and followed by the inner driver's `poll`. Over a driver with a
+`backend_fd` — the `uv` driver — a helper thread, the watcher, `poll(2)`s that descriptor and wakes
+the pump when it turns readable: a socket's bytes, a job finishing on libuv's pool or a `Remote`'s
+`uv_async` end the toolkit's wait with no timer anywhere and no processor time while idle. A gate
+between the loop and the watcher stops it waking the pump again until the loop has taken the events
+in. The watcher starts on the first active wait over a descriptor and is joined when the driver is
+dropped. Over a driver with none, the pump's wait is bounded by kairos's timers alone, and to a
+millisecond at a time while that driver is busy, since nothing could end the wait when its work
+completes.
+
+**The pump's wait runs inside the pass, on the thread that called `run`, `block_on` or `pass`**, so
+with a toolkit that insists on the main thread, the loop runs there; kairos itself never asks which
+thread is main. The composed driver's `waker` wakes both the inner driver and the pump, so a
+notifier, a `lp.remote(k)` and a `d.remote(k)` all end its wait. `signal` from another thread still
+wakes nothing — it is the interrupt half — and a thread uses a remote. The module carries
+`@requires(posix)` and names neither libuv nor a toolkit, so it needs no feature and a board never
+reaches it. `run` and `block_on` poll a busy driver after each pass, before they wait, so a read a
+task begins in one pass is on the descriptor before the watcher polls it. A Cocoa modal loop — a live
+window resize, an open menu — runs inside the toolkit's wait and holds the pass up until the gesture
+ends. The design is `docs/design/two-sources.md`.
+
 ## Other threads, and background waits
 
 A loop belongs to the thread that runs it. Another thread reaches it through a value it is handed,
@@ -270,6 +309,10 @@ Two ship in the core, and a third behind the `uv` feature ([below](#the-uv-featu
   slices of a millisecond, checking `signalled()` and its waker's flag between them, so a second
   thread standing in for a peripheral, or waking a notifier, is noticed within a millisecond.
 
+**`sh.sysl.kairos.pump`** composes any of them with a toolkit's own wait
+([above](#two-sources-that-each-want-to-block-shsyslkairospump)); like `host`, it carries
+`@requires(posix)`.
+
 **The board driver comes with the board.** It is the trait above and nothing more: `now` reads a
 SysTick-driven tick count (or a free-running timer), and `idle_until` masks interrupts, returns if
 `signalled()`, programs the SysTick or a timer compare for the deadline when there is one, executes
@@ -292,7 +335,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7", features = [uv] }
 }
 ```
 
@@ -460,6 +503,17 @@ parked rather than cancelled, and no cross-talk between notifiers or loops; on t
 a real thread; and on the `uv` driver with 1,024 loops on 1,024 threads, each woken alone and in turn,
 with the process's processor time measured while all of them wait — and a loop waiting only on another
 thread counted at a handful of passes in 300 ms, where the old one-millisecond slice made hundreds.
+The composed driver runs over a pipe pump — `wait` is `poll(2)` on a pipe, the waker writes a byte —
+so it needs no window: an inactive pump leaves the simulated driver's waits exactly as they were and
+is never asked; an active one is ended on time by a kairos timer, by an event arriving on the pump, by
+its waker, a remote, a loop remote and a notifier from another thread, and is sliced to a millisecond
+over a busy driver with no descriptor; the watcher turns a descriptor's readiness into one pump wake
+an event, re-arms, survives waits the pump ended itself, and is joined when the driver is dropped.
+Over the `uv` driver, a TCP echo whose server pauses on libuv's pool and a 30 ms pool job each end the
+pump's wait through the watcher alone, under a two-second cap and a count of waits; a libuv timer
+bounds the wait through `backend_timeout`; and an inactive pump leaves timers and a TCP echo as they
+were. `run` and `block_on` are held to polling a busy driver before each wait, and to ending without
+one when that poll finishes the driver's last work.
 ASan instruments the sysl half only: libuv is a `pkg_config` library someone else compiled.
 
 ## License

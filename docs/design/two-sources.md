@@ -1,6 +1,8 @@
 # Two sources that each want to block
 
-**Status: design, no code.** Answers FunL's finding F2 (`funl/docs/design/graphics.md`, "What the
+**Status: decided (user, 2026-10-16), every question as recommended; built in kairos 0.1.7** as
+`sh.sysl.kairos.pump` (`Pump`, `pumped`, `Pumped.remote`, which answers a `PumpRemote`). The SDL pump
+(K4) and webview's wait (K10) are those repositories' own. Answers FunL's finding F2 (`funl/docs/design/graphics.md`, "What the
 packages lack"): a program with a window on screen and an `async` task reading a file waits on libuv
 *and* on a GUI toolkit's event queue at once, and today no kairos driver can.
 
@@ -160,9 +162,10 @@ watcher thread:                                  loop thread, in idle_until:
 
 **Registration is flushed before the wait.** libuv applies a newly started watch to kqueue or epoll
 only inside its next `uv_run`, so a read a task started in this pass is not yet on the descriptor the
-helper watches. `pass` already ends with `if driver.busy() then driver.poll()` for exactly this
-reason; `run` and `block_on` do not, because the `uv` driver's `idle_until` runs libuv itself. The
-composed driver needs the same flush on that path (K2).
+helper watches. `pass` takes one driver turn and leaves the flush to the next pass, which libuv
+allows for by answering a zero `uv_backend_timeout` while a watch is not yet applied; `run` and
+`block_on` did not flush either, because the `uv` driver's `idle_until` runs libuv itself. The
+composed driver needs the flush on that path (K2).
 
 ### Raising a source from another thread
 
@@ -233,62 +236,64 @@ a pushed user event from a second thread ends `SDL_WaitEventTimeout` early.
 ## Open questions
 
 **K1. Shape — a new driver, a composing driver, or a hook on `Driver`?**
-Recommendation: **a composing driver over a new `Pump` trait.** A hook on `Driver` (an optional
+Decided (user, 2026-10-16): **a composing driver over a new `Pump` trait.** A hook on `Driver` (an optional
 `set_waker`) would make every driver, the board's included, carry a closure it can never use; a
 dedicated SDL driver would be copied for webview and every toolkit after. The composition keeps
 `Driver` as it is and gives each toolkit a thirty-line pump.
 
 **K2. Should `run`/`block_on` flush registrations with `driver.poll()` after each pass while the driver
 is busy, as `pass` does?**
-Recommendation: **yes, in the core.** Without it a read begun in the last pass is not on the
+Decided (user, 2026-10-16): **yes, in the core.** Without it a read begun in the last pass is not on the
 descriptor the watcher polls, which is a stall with no timer to end it. The cost is one
-`uv_run(NOWAIT)` per pass on the `uv` driver, and nothing on a driver whose `busy` is false.
+`uv_run(NOWAIT)` per pass on the `uv` driver, and nothing on a driver whose `busy` is false. As
+built, the flush is followed by a second look at `alive`: a flush can complete the driver's last work
+(a close), and a pump's wait with nothing left to end it would be for ever.
 
 **K3. Where does the module live, and behind which feature?**
-Recommendation: **`sh.sysl.kairos.pump`, in the core package, `@requires(posix)` on the module, no
+Decided (user, 2026-10-16): **`sh.sysl.kairos.pump`, in the core package, `@requires(posix)` on the module, no
 feature.** It uses threads and `poll(2)`, never libuv or SDL, so it costs a non-user nothing and a
 board never reaches it.
 
 **K4. Where does the SDL pump live?**
-Recommendation: **in `sysl-lang/sdl3`, behind an optional `kairos` feature** (an optional dependency,
+Decided (user, 2026-10-16): **in `sysl-lang/sdl3`, behind an optional `kairos` feature** (an optional dependency,
 as kairos's own `uv` feature is), so `syslui-sdl`, FunL and any SDL program share one. FunL's routing
 of events to canvases stays FunL's: the sdl3 pump takes a `&Fn(Event)` sink.
 
 **K5. How does another thread raise a source when the pump is the one waiting?**
-Recommendation: **`remote(n)` on the composed driver (`signal` then the pump's waker); `signal` itself
+Decided (user, 2026-10-16): **`remote(n)` on the composed driver (`signal` then the pump's waker); `signal` itself
 untouched.** Over `uv` the existing `Remote` already works through the watcher, so both spellings
 wake.
 
 **K6. A loop's driver is fixed at creation, but FunL learns it needs SDL only when a window opens.**
-Recommendation: **`Pump.active()`; an inactive pump makes the composed driver its inner driver
+Decided (user, 2026-10-16): **`Pump.active()`; an inactive pump makes the composed driver its inner driver
 exactly**, so FunL composes at start-up and a program that never opens a window pays one boolean test
 per wait.
 
 **K7. Should a pump be able to watch the descriptor natively (CFFileDescriptor, `g_unix_fd_add`,
 `QSocketNotifier`) instead of the helper thread?**
-Recommendation: **not now.** The helper works on every POSIX host with one mechanism; add an optional
+Decided (user, 2026-10-16): **not now.** The helper works on every POSIX host with one mechanism; add an optional
 `Pump.watch(fd) -> bool` later, answered true by a pump that took the descriptor itself, which
 switches the watcher off. The case that would force it is K9.
 
 **K8. Windows, where libuv's backend is an I/O completion port and `uv_backend_fd` answers -1.**
-Recommendation: **out of scope until sysl has a Windows target**, with one rule now so it can never
+Decided (user, 2026-10-16): **out of scope until sysl has a Windows target**, with one rule now so it can never
 stall: while the inner driver is busy and has no descriptor, the composed driver caps each pump wait
 at a one-millisecond slice, as the `host` and `uv` drivers already do where nothing can wake them. (Electron's form there is `GetQueuedCompletionStatus` on the port and
 re-posting the packet; the watcher is the place it would go.)
 
 **K9. Cocoa's modal loops — a live window resize, an open menu — run inside SDL's event pump and
 starve the kairos pass for their duration.**
-Recommendation: **accept, and document.** Timers and libuv work resume when the gesture ends; SDL3's
+Decided (user, 2026-10-16): **accept, and document.** Timers and libuv work resume when the gesture ends; SDL3's
 event watch still delivers expose events during a resize, so a canvas can repaint. The cure, if a
 program needs it, is K7's run-loop source in the common modes.
 
 **K10. webview has a thread-safe wake (`dispatch`) but no blocking wait with a timeout — only `run`,
 which keeps the thread, and `pump`, which does not wait.**
-Recommendation: **send sysl-lang/webview a finding: a `wait(timeout)` in `pump.c`**
+Decided (user, 2026-10-16): **send sysl-lang/webview a finding: a `wait(timeout)` in `pump.c`**
 (`nextEventMatchingMask:untilDate:` + `sendEvent:` on macOS, `g_main_context_iteration` with a timeout
 source on GTK). With it, webview's pump is the same thirty lines as SDL's.
 
 **K11. sysl-lang/sdl3 binds `SDL_PushEvent` and `user_event`, but not `SDL_RegisterEvents`, so the
 pump's wake would use the shared `EVENT_USER` with a reserved code.**
-Recommendation: **bind `SDL_RegisterEvents` in sdl3 (a finding to that repo)**, so the pump's wake
+Decided (user, 2026-10-16): **bind `SDL_RegisterEvents` in sdl3 (a finding to that repo)**, so the pump's wake
 event cannot collide with a program's own user events.

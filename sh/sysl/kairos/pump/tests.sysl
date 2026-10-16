@@ -1,0 +1,512 @@
+module sh.sysl.kairos.pump
+@requires(posix)
+@tests
+
+// The composed driver over a pipe pump: `wait` is `poll(2)` on a pipe for the timeout, the waker
+// writes a byte, `poll` drains it. It needs no window and no toolkit, so it runs headless. A byte of
+// `event` stands for a toolkit event arriving -- a click -- and is handed to the pump's sink.
+
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_mut_ptr
+import sysl.sync.Atomic
+import sysl.threads.spawn
+import sysl.time.{Duration, millis, micros, whole_micros}
+import sysl.posix.time.{monotonic, sleep}
+import sh.sysl.kairos.{Driver, Loop, Notifier, OutOfRange, event_loop, signal, signalled, NoWait}
+import sh.sysl.kairos.host.{Host, host}
+import sh.sysl.kairos.sim.{Sim, sim}
+
+private[pump] struct Pending
+    set: Atomic[u32]
+
+private[pump] const wake_byte: u8 = 1
+private[pump] const event_byte: u8 = 2
+
+/** A pump over a pipe. Every wait, its timeout and every poll is counted, and each `event` byte taken
+ * in is handed to `sink`.
+ */
+private[pump] struct PipePump
+    r: i32
+    w: i32
+    on: bool
+    holding: bool
+    pending: &sync Pending
+    sink: &Fn() -> unit
+    waits: int
+    polls: int
+    events: int
+    timeouts: Buf[Option[Duration]]
+
+    // Take in every byte already in the pipe. The flag is cleared before the read, so a wake sent
+    // after the read finds it clear and writes again.
+    private drain(*self)
+        self.pending.set.store(0)
+
+        var bytes: [64]u8 = [0; 64]
+
+        loop
+            var p = PollFd(self.r, 1, 0)
+            if test_poll(&p, 1, 0) <= 0 then return
+
+            val n = test_read(self.r, as_mut_ptr(bytes), 64)
+            if n <= 0 then return
+
+            for i in 0..<usize(n)
+                if bytes[i] == event_byte
+                    self.events += 1
+                    (self.sink)()
+    end drain
+end PipePump
+
+impl Pump for PipePump
+    active(*self) -> bool = self.on
+
+    wait(*self, timeout: Option[Duration])
+        self.waits += 1
+        self.timeouts.push(timeout)
+
+        // Rounded up, so the wait never ends before the timeout.
+        val ms = timeout match
+            Some(d) -> i32((whole_micros(d) + 999) / 1000)
+            None -> -1
+
+        var p = PollFd(self.r, 1, 0)
+        test_poll(&p, 1, ms)
+        self.drain()
+    end wait
+
+    poll(*self)
+        self.polls += 1
+        self.drain()
+
+    override busy(*self) -> bool = self.holding
+
+    waker(*self) -> &sync Fn() -> unit
+        val f = self.pending
+        val w = self.w
+
+        () -> if f.set.swap(1) == 0 then put(w, wake_byte)
+end PipePump
+
+impl Drop for PipePump
+    drop(self)
+        test_close(self.r)
+        test_close(self.w)
+
+/** An active pipe pump, or an inactive one, whose events go to `sink`. */
+private[pump] pipe_pump(on: bool, sink: &Fn() -> unit = () -> ()) -> &PipePump
+    var fds: [2]i32 = [-1, -1]
+
+    assert(test_pipe(as_mut_ptr(fds)) == 0, "a pipe")
+    PipePump(fds[0], fds[1], on, false, Pending(Atomic(0)), sink, 0, 0, 0, buf())
+
+private[pump] struct PollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+private[pump] extern "pipe" test_pipe(fds: *i32) -> i32
+private[pump] extern "read" test_read(fd: i32, p: *u8, n: usize) -> isize
+private[pump] extern "write" test_write(fd: i32, p: *u8, n: usize) -> isize
+private[pump] extern "close" test_close(fd: i32) -> i32
+private[pump] extern "poll" test_poll(fds: *PollFd, n: usize, ms: i32) -> i32
+
+private[pump] put(fd: i32, b: u8)
+    var one = b
+    test_write(fd, &one, 1)
+
+private[pump] ms_since(t: Duration) -> long = whole_micros(monotonic() - t) / 1000
+
+// ---- another thread --------------------------------------------------------------------------------
+
+// What a second thread does after `delay_ms`: write `byte` to `fd` where it is not negative, then call
+// `wake`.
+private[pump] struct Later
+    delay_ms: long
+    fd: i32
+    byte: u8
+    wake: &sync Fn() -> unit
+
+private[pump] later(s: *Later) -> unit
+    sleep(millis(s.delay_ms))
+    if s.fd >= 0 then put(s.fd, s.byte)
+    (s.wake)()
+
+// ---- inactive --------------------------------------------------------------------------------------
+
+@test("an inactive pump leaves the inner driver exactly as it was: its waits, and the pump untouched")
+inactive_is_the_inner_driver()
+    assert(!signalled())
+
+    val s = sim()
+    val p = pipe_pump(false)
+    val lp = event_loop(pumped(s, p))
+    val log: &Buf[long] = buf()
+
+    lp.after(millis(10), (l) -> log.push(whole_micros(l.now()) / 1000))
+    lp.after(millis(25), (l) -> log.push(whole_micros(l.now()) / 1000))
+    lp.run()
+
+    assert_eq(log.len(), 2)
+    assert_eq(log[0], 10)
+    assert_eq(log[1], 25)
+    assert_eq(s.waits().len, 2)
+    assert(s.waits()[0] == Some(millis(10)) && s.waits()[1] == Some(millis(25)), "the sim was handed each deadline")
+    assert_eq(p.waits, 0)
+    assert_eq(p.polls, 0, "an inactive pump is not polled")
+    assert_eq(watchers.load(), 0)
+end inactive_is_the_inner_driver
+
+@test("the composed driver's own members: one clock, either busy, no descriptor and no backend limit")
+composed_members()
+    val h = host()
+    val p = pipe_pump(false)
+    val d = pumped(h, p)
+
+    assert(!d.busy())
+    p.holding = true
+    assert(d.busy(), "a pump holding a window keeps the loop alive")
+    assert(d.backend_fd().is_none())
+    assert(d.backend_timeout().is_none())
+    assert(!d.quiet())
+
+    val a = d.now()
+    val b = h.now()
+    assert(b >= a && b - a < millis(100), "the inner driver's clock")
+
+    d.poll()
+    assert_eq(p.polls, 0, "inactive: only the inner driver is polled")
+    p.on = true
+    d.poll()
+    assert_eq(p.polls, 1)
+end composed_members
+
+// ---- the pump's wait -------------------------------------------------------------------------------
+
+@test("a kairos timer ends the pump's wait on time, with nothing else to wake it and no spinning")
+timer_ends_the_wait()
+    val p = pipe_pump(true)
+    val lp = event_loop(pumped(host(), p))
+    val started = monotonic()
+
+    lp.block_on(lp.sleep(millis(30))).expect("the sleep ends")
+
+    val took = ms_since(started)
+
+    assert(took >= 30, s"no sooner than the timer: $took ms")
+    assert(took < 1000, s"not much later: $took ms")
+    assert(p.waits >= 1 && p.waits <= 3, s"one wait or so, not a spin: ${p.waits}")
+
+    p.timeouts[0] match
+        Some(t) -> assert(t > millis(20) && t <= millis(30), "bounded by the timer")
+        None -> assert(false, "the first wait had the timer's limit")
+
+    assert_eq(watchers.load(), 0, "the host driver has no descriptor to watch")
+end timer_ends_the_wait
+
+@test("an event arriving on the pump from another thread wakes the task waiting for it, in the same wait")
+pump_event_wakes_a_task()
+    val box: &Buf[&Notifier] = buf()
+    val p = pipe_pump(true, () -> box[0].waker().wake())
+    val lp = event_loop(pumped(host(), p))
+
+    box.push(lp.notifier())
+
+    var s = Later(30, p.w, event_byte, () -> ())
+    val started = monotonic()
+    val t = spawn(&later, &s).unwrap()
+
+    // Five seconds: only the event ends it sooner.
+    val got = lp.block_on(lp.timeout(millis(5000), box[0].next())).expect("ran")
+    val took = ms_since(started)
+
+    assert(t.join())
+    assert(got.is_some(), "the event woke the task")
+    assert(took >= 25 && took < 1000, s"woken by the event, not the deadline: $took ms")
+    assert_eq(p.events, 1)
+end pump_event_wakes_a_task
+
+@test("the composed driver's waker ends a pump wait with no limit, from another thread")
+waker_ends_a_blocked_wait()
+    val p = pipe_pump(true)
+    val d = pumped(host(), p)
+    var s = Later(30, -1, 0, d.waker())
+    val started = monotonic()
+    val t = spawn(&later, &s).unwrap()
+
+    d.idle_until(None)
+
+    val took = ms_since(started)
+
+    assert(t.join())
+    assert(took >= 25 && took < 1000, s"ended by the wake: $took ms")
+    assert_eq(p.waits, 1)
+    assert(p.timeouts[0].is_none(), "nothing bounded the wait")
+end waker_ends_a_blocked_wait
+
+@test("a wake sent before the wait makes it return at once, and a burst of wakes is one")
+early_wakes_coalesce()
+    val p = pipe_pump(true)
+    val d = pumped(host(), p)
+    val w = d.waker()
+
+    for i in 0..<100
+        w()
+
+    val started = monotonic()
+    d.idle_until(None)
+    assert(ms_since(started) < 500, "the wake was kept for the wait")
+
+    // The burst left one byte, which that wait took: the next wait has nothing to end it.
+    val again = monotonic()
+    d.idle_until(Some(d.now() + millis(20)))
+    assert(ms_since(again) >= 15, "no second wake was left behind")
+    assert_eq(p.waits, 2)
+end early_wakes_coalesce
+
+@test("a remote, a loop remote and a notifier each end the pump's wait from another thread over host()")
+remotes_wake_the_pump()
+    val p = pipe_pump(true)
+    val d = pumped(host(), p)
+    val lp = event_loop(d)
+
+    val r = d.remote(4).expect("in range")
+    assert_eq(r.number(), 4)
+
+    var s = Later(30, -1, 0, () -> r.raise())
+    var started = monotonic()
+    var t = spawn(&later, &s).unwrap()
+
+    // Five seconds each: only the wakes end them sooner.
+    val got = lp.block_on(lp.timeout(millis(5000), lp.wait_for(4))).expect("ran")
+    assert(t.join())
+    assert(got.is_some(), "the source was raised")
+    assert(ms_since(started) < 1000, "ended by the remote, not the deadline")
+
+    val lr = lp.remote(6).expect("in range")
+    s = Later(30, -1, 0, () -> lr.raise())
+    started = monotonic()
+    t = spawn(&later, &s).unwrap()
+
+    val got6 = lp.block_on(lp.timeout(millis(5000), lp.wait_for(6))).expect("ran")
+    assert(t.join())
+    assert(got6.is_some(), "the loop's own remote reaches the pump through the driver's waker")
+    assert(ms_since(started) < 1000)
+
+    val n = lp.notifier()
+    val nw = n.waker()
+    s = Later(30, -1, 0, () -> nw.wake())
+    started = monotonic()
+    t = spawn(&later, &s).unwrap()
+
+    val woke = lp.block_on(lp.timeout(millis(5000), n.next())).expect("ran")
+    assert(t.join())
+    assert(woke.is_some(), "the notifier was woken")
+    assert(ms_since(started) < 1000)
+end remotes_wake_the_pump
+
+@test("remote refuses a source past the last, as Loop.remote does")
+remote_out_of_range()
+    val d = pumped(host(), pipe_pump(true))
+
+    assert(d.remote(31).is_ok())
+
+    d.remote(32) match
+        Err(OutOfRange(n)) -> assert_eq(n, 32)
+        _ -> assert(false, "32 is out of range")
+end remote_out_of_range
+
+@test("a signal already raised ends the wait before the pump is asked to wait")
+signalled_skips_the_pump()
+    assert(!signalled())
+
+    val p = pipe_pump(true)
+    val d = pumped(host(), p)
+    val lp = event_loop(d)
+    val seen: &Buf[u32] = buf()
+
+    lp.on(7, (l) -> seen.push(7)).expect("free")
+    signal(7)
+    d.idle_until(None)
+    assert_eq(p.waits, 0)
+
+    lp.pass(NoWait)
+    assert_eq(seen.len(), 1)
+    assert(!signalled())
+    assert(lp.off(7))
+end signalled_skips_the_pump
+
+@test("a pump that turns active mid-life takes the waits from then on, and back again")
+activity_switches_the_waiter()
+    val p = pipe_pump(false)
+    val d = pumped(host(), p)
+
+    d.idle_until(Some(d.now() + millis(5)))
+    assert_eq(p.waits, 0, "inactive: the host slept")
+
+    p.on = true
+    d.idle_until(Some(d.now() + millis(5)))
+    assert_eq(p.waits, 1)
+
+    p.on = false
+    d.idle_until(Some(d.now() + millis(5)))
+    assert_eq(p.waits, 1)
+end activity_switches_the_waiter
+
+// ---- the one-millisecond slice ---------------------------------------------------------------------
+
+/** The host driver, holding work it has no descriptor for: nothing could end a pump's wait when it
+ * completes.
+ */
+private struct Busy
+    h: &Host
+
+impl Driver for Busy
+    now(*self) -> Duration = self.h.now()
+    idle_until(*self, deadline: Option[Duration]) = self.h.idle_until(deadline)
+    override busy(*self) -> bool = true
+
+@test("while the inner driver is busy with no descriptor, each pump wait is capped at a millisecond")
+busy_without_a_descriptor_is_sliced()
+    val p = pipe_pump(true)
+    val b: &Busy = Busy(host())
+    val d = pumped(b, p)
+
+    d.idle_until(None)
+    d.idle_until(Some(d.now() + millis(50)))
+
+    assert_eq(p.waits, 2)
+    assert(p.timeouts[0] == Some(millis(1)), "an unbounded wait is sliced")
+    assert(p.timeouts[1] == Some(millis(1)), "a long one too")
+end busy_without_a_descriptor_is_sliced
+
+@test("an idle inner driver leaves the pump's wait unbounded, or bounded by the deadline alone")
+idle_inner_is_not_sliced()
+    val q = pipe_pump(true)
+    val e = pumped(host(), q)
+
+    e.waker()()
+    e.idle_until(None)
+    e.idle_until(Some(e.now() + millis(20)))
+
+    assert_eq(q.waits, 2)
+    assert(q.timeouts[0].is_none(), "no limit")
+
+    q.timeouts[1] match
+        Some(t) -> assert(t > millis(10) && t <= millis(20), "the deadline's")
+        None -> assert(false, "bounded by the deadline")
+end idle_inner_is_not_sliced
+
+// ---- the watcher -----------------------------------------------------------------------------------
+
+/** The host driver with a descriptor of its own, as libuv's backend: a pipe whose bytes are the
+ * driver's events, taken in by `poll`. It holds work while `holding`.
+ */
+private[pump] struct Fd
+    h: &Host
+    r: i32
+    w: i32
+    holding: bool
+    taken: int
+    polls: int
+
+impl Driver for Fd
+    now(*self) -> Duration = self.h.now()
+    idle_until(*self, deadline: Option[Duration]) = self.h.idle_until(deadline)
+    override busy(*self) -> bool = self.holding
+    override backend_fd(*self) -> Option[int] = Some(int(self.r))
+
+    override poll(*self)
+        self.polls += 1
+
+        var b: u8 = 0
+
+        loop
+            var p = PollFd(self.r, 1, 0)
+            if test_poll(&p, 1, 0) <= 0 then return
+            if test_read(self.r, &b, 1) == 1 then self.taken += 1
+    end poll
+end Fd
+
+impl Drop for Fd
+    drop(self)
+        test_close(self.r)
+        test_close(self.w)
+
+private[pump] fd_driver() -> &Fd
+    var fds: [2]i32 = [-1, -1]
+
+    assert(test_pipe(as_mut_ptr(fds)) == 0, "a pipe")
+    Fd(host(), fds[0], fds[1], true, 0, 0)
+
+// Two waits with no limit, each ended by a byte on the inner driver's descriptor: one written by
+// another thread during the wait, one written before the wait began.
+private watch_twice(f: &Fd, p: &PipePump)
+    val d = pumped(f, p)
+
+    var s = Later(30, f.w, 1, () -> ())
+    val started = monotonic()
+    val t = spawn(&later, &s).unwrap()
+
+    d.idle_until(None)
+
+    assert(t.join())
+    assert(ms_since(started) < 1000, "the watcher woke the pump")
+    assert_eq(watchers.load(), 1, "one watcher, started on the first arm")
+    assert_eq(p.waits, 1, "one wait: neither a stall nor a spin")
+    assert_eq(f.taken, 1, "the inner driver took its event in after the wait")
+
+    // Already readable before the watcher polls: nothing is lost.
+    put(f.w, 1)
+    d.idle_until(None)
+
+    assert_eq(p.waits, 2, "the watcher re-armed, once")
+    assert_eq(f.taken, 2)
+    assert_eq(watchers.load(), 1, "the same watcher")
+end watch_twice
+
+@test("the watcher turns the inner driver's descriptor into one pump wake per event, and is joined on drop")
+watcher_wakes_the_pump()
+    assert_eq(watchers.load(), 0)
+
+    val f = fd_driver()
+    val p = pipe_pump(true)
+
+    watch_twice(f, p)
+    assert_eq(watchers.load(), 0, "dropping the composed driver joined its watcher")
+end watcher_wakes_the_pump
+
+@test("a wait ended by the pump leaves the watcher armed, and its later wake costs one empty pass")
+watcher_survives_other_wakes()
+    val f = fd_driver()
+    val p = pipe_pump(true)
+    val d = pumped(f, p)
+    val w = d.waker()
+
+    w()
+    d.idle_until(None)
+    assert_eq(f.taken, 0)
+    assert_eq(p.waits, 1)
+
+    // The watcher is still polling: a byte now wakes the pump with no new arm.
+    var s = Later(20, f.w, 1, () -> ())
+    val t = spawn(&later, &s).unwrap()
+    val started = monotonic()
+
+    d.idle_until(None)
+    assert(t.join())
+    assert(ms_since(started) < 1000)
+    assert_eq(f.taken, 1)
+    assert_eq(p.waits, 2)
+    assert_eq(watchers.load(), 1, "one watcher, armed once")
+end watcher_survives_other_wakes
+
+@test("an inactive pump never starts a watcher, even over a driver with a descriptor")
+inactive_starts_no_watcher()
+    val f = fd_driver()
+    val d = pumped(f, pipe_pump(false))
+
+    put(f.w, 1)
+    d.idle_until(Some(d.now() + millis(5)))
+    assert_eq(watchers.load(), 0)
+end inactive_starts_no_watcher

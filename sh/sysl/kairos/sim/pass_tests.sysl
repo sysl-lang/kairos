@@ -357,3 +357,75 @@ one_turn_a_pass()
     assert_eq(log.len(), 9)
     assert_eq(d.polls + d.waits, 15)
 end one_turn_a_pass
+
+// ---- run and block_on flush the driver before they wait -------------------------------------------
+
+/** A driver that records whether each wait came straight after a poll. Its waits return at once,
+ * moving the clock to the deadline.
+ */
+private struct Flushes
+    clock: Duration
+    holding: bool
+    lets_go: bool
+    flushed: bool
+    waits: int
+    polls: int
+    unflushed: int
+
+impl Driver for Flushes
+    now(*self) -> Duration = self.clock
+
+    idle_until(*self, deadline: Option[Duration])
+        self.waits += 1
+        if !self.flushed then self.unflushed += 1
+        self.flushed = false
+
+        deadline match
+            Some(d) -> if d > self.clock then self.clock = d
+            None -> ()
+    end idle_until
+
+    override busy(*self) -> bool = self.holding
+
+    override poll(*self)
+        self.polls += 1
+        self.flushed = true
+        if self.lets_go then self.holding = false
+end Flushes
+
+private async naps(lp: &Loop[Flushes], n: int)
+    for i in 0..<n
+        await lp.sleep(millis(10))
+
+@test("block_on and run poll a busy driver after each pass, before they wait, and an idle one not at all")
+drive_flushes_a_busy_driver()
+    assert(!signalled())
+
+    val busy: &Flushes = Flushes(millis(0), true, false, false, 0, 0, 0)
+    val lp = event_loop(busy)
+
+    lp.block_on(naps(lp, 3)).expect("the naps end")
+    assert_eq(busy.waits, 3)
+    assert_eq(busy.unflushed, 0, "every wait came straight after a poll")
+
+    val idle: &Flushes = Flushes(millis(0), false, false, false, 0, 0, 0)
+    val lq = event_loop(idle)
+
+    lq.spawn(naps(lq, 3))
+    lq.run()
+    assert_eq(idle.waits, 3)
+    assert_eq(idle.polls, 0, "a driver holding nothing is not polled")
+end drive_flushes_a_busy_driver
+
+@test("a flush that finishes the driver's last work ends run without a wait, which would be for ever")
+flush_that_empties_the_loop_ends_run()
+    assert(!signalled())
+
+    val d: &Flushes = Flushes(millis(0), true, true, false, 0, 0, 0)
+    val lp = event_loop(d)
+
+    lp.run()
+    assert_eq(d.polls, 1)
+    assert_eq(d.waits, 0, "nothing was left to wait for")
+    assert(!lp.alive())
+end flush_that_empties_the_loop_ends_run

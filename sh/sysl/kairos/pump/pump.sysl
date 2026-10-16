@@ -1,0 +1,333 @@
+module sh.sysl.kairos.pump
+@requires(posix)
+
+import sysl.sync.Atomic
+import sysl.slices.as_mut_ptr
+import sysl.threads.{Thread, spawn}
+import sysl.time.{Duration, millis, micros}
+import sh.sysl.kairos.{Driver, SourceError, OutOfRange, max_sources, signal, signalled}
+
+/** A second blocking source beside a driver -- a GUI toolkit's event queue -- and the driver that
+ * waits on both at once.
+ *
+ * A kairos loop waits in one place, `Driver.idle_until`. A program with a window on screen and a task
+ * reading a file has two things that each want to block the thread: libuv's descriptor and the
+ * toolkit's own wait, and neither can see the other's wake-ups. `pumped(inner, pump)` composes the
+ * two: while the pump is active, every wait is the pump's, bounded by the loop's timers and the inner
+ * driver's own, and a helper thread watching the inner driver's `backend_fd` ends the pump's wait
+ * through its thread-safe `waker` when the inner driver has something to take in.
+ *
+ * Nothing here names libuv or a toolkit, and nothing here reaches the core's interrupt path:
+ * `signal` stays one atomic OR. The module asks for POSIX -- a thread, a pipe and `poll(2)` -- so a
+ * board never imports it.
+ */
+
+/** The other blocking source: a toolkit's event queue, a window system's, a runtime's. It is the
+ * `Driver` trait's waiting half with the clock taken out -- the inner driver owns time -- and a
+ * thread-safe `waker` added.
+ *
+ * Every member but `waker` is called on the loop's thread, which for most toolkits has to be the
+ * process's main thread; a pump that cares checks it when it is made.
+ */
+trait Pump
+    /** Whether the pump has anything to wait on now: a window open, a webview alive. While it is
+     * false the composed driver is the inner driver, unchanged.
+     */
+    active(*self) -> bool
+
+    /** Block this thread until the pump has events, until `waker` is called from any thread, or for
+     * `timeout`, whichever is first; `None` waits with no limit. Take in what arrived: route each
+     * event to whoever waits on it and wake their tasks. It may return early for any reason.
+     */
+    wait(*self, timeout: Option[Duration])
+
+    /** Take in what has already arrived, without waiting. */
+    poll(*self)
+
+    /** Whether the pump holds work a task waits on, which keeps the loop alive: a window on screen. */
+    busy(*self) -> bool = false
+
+    /** The one member callable from another thread: end a `wait` in progress, or make the next one
+     * return at once. Coalescing is the pump's: at most one wake need sit in its queue. It must neither
+     * allocate nor block, and it is asked for once.
+     */
+    waker(*self) -> &sync Fn() -> unit
+
+/** The longest one pump wait lasts while the inner driver holds work it has no descriptor for, so
+ * nothing could end the wait when that work completes: the same slice the `host` and `uv` drivers
+ * sleep in where nothing can wake them.
+ */
+val busy_slice: Duration = millis(1)
+
+/** An inner driver and a pump, waited on as one. `pumped` makes one; it is the `Driver` a loop is
+ * built over: `event_loop(pumped(uv(), my_pump()))`.
+ *
+ * | member | composed |
+ * |---|---|
+ * | `now` | the inner driver's: one clock |
+ * | `busy` | either is |
+ * | `poll` | the inner driver's, then the pump's when it is active |
+ * | `idle_until` | the inner driver's while the pump is inactive; else the pump's `wait`, bounded by the deadline and the inner driver's `backend_timeout`, then the inner driver's `poll` |
+ * | `waker` | the inner driver's and the pump's, both |
+ * | `quiet` | the inner driver's |
+ * | `backend_fd`, `backend_timeout` | `None`: the composed driver is the program's loop, not something to embed |
+ *
+ * **The inner driver's own `idle_until` is never called while the pump is active**, so it needs only
+ * `now`, `poll`, `busy`, `backend_fd` and `backend_timeout`, which is what the `uv` driver offers an
+ * embedder. Over a driver with a descriptor, a helper thread -- the watcher -- `poll(2)`s it and wakes
+ * the pump when it turns readable; over one without, the pump's wait is bounded by the loop's own
+ * timers alone, and by a one-millisecond slice while the inner driver is busy.
+ *
+ * Dropping it stops and joins the watcher, so no thread outlives it.
+ */
+struct Pumped[D: Driver, P: Pump]
+    private inner: &D
+    private pump: &P
+    private watch: Watch
+    private watcher: Option[Thread]
+    private armed: bool
+    private wakes: Option[&sync Fn() -> unit]
+    private pump_wake: Option[&sync Fn() -> unit]
+
+    /** A handle another thread raises source `n` through while the pump may be the one waiting:
+     * `signal(n)`, then this driver's wake. `OutOfRange` for a number `Loop.on` would refuse.
+     *
+     * `signal` from another thread sets its bit and wakes nothing, which is right for the interrupt
+     * path and wrong for a thread: over the `uv` driver a `Loop.remote` already wakes the pump
+     * through the watcher, but over `host()` or `sim()` nothing would. This value wakes either.
+     */
+    remote(*self, n: u32) -> Result[PumpRemote, SourceError]
+        if n >= max_sources then return Err(OutOfRange(n))
+
+        Ok(PumpRemote(n, self.wake_both()))
+
+    // The pump's waker, asked for once.
+    private wake_pump(*self) -> &sync Fn() -> unit
+        self.pump_wake match
+            Some(w) -> w
+            None ->
+                val w = self.pump.waker()
+
+                self.pump_wake = Some(w)
+                w
+    end wake_pump
+
+    // The inner driver's wake and the pump's, as one closure: whichever of the two is waiting, it
+    // ends.
+    private wake_both(*self) -> &sync Fn() -> unit
+        self.wakes match
+            Some(w) -> w
+            None ->
+                val a = self.inner.waker()
+                val b = self.wake_pump()
+                val w: &sync Fn() -> unit = () ->
+                    a()
+                    b()
+
+                self.wakes = Some(w)
+                w
+    end wake_both
+
+    // Open the watcher's gate if it is closed, starting the watcher on the first arm over an inner
+    // driver with a descriptor. Over one without, there is nothing to watch.
+    private arm(*self)
+        if self.armed then return
+
+        if self.watcher.is_none()
+            val fd = self.inner.backend_fd() match
+                Some(fd) -> fd
+                None -> return
+
+            if !self.watch.open(i32(fd), self.wake_pump()) then return
+
+            spawn(&watch_body, &self.watch) match
+                Some(t) -> self.watcher = Some(t)
+                None ->
+                    self.watch.close()
+                    return
+
+        self.armed = true
+        self.watch.open_gate()
+    end arm
+end Pumped
+
+/** Raises a source from any thread and ends the composed driver's wait, as `Pumped.remote` makes
+ * it. It is a value: copy it to as many threads as raise the source. The driver has to outlive it.
+ */
+struct PumpRemote
+    private source: u32
+    private wake: &sync Fn() -> unit
+
+    /** `signal` the source, then end the driver's wait -- the pump's or the inner driver's. */
+    raise(self)
+        signal(self.source)
+        (self.wake)()
+
+    /** The source this raises. */
+    number(self) -> u32 = self.source
+end PumpRemote
+
+/** `inner` and `pump`, waited on as one driver. Until `pump.active()` it is `inner`, exactly. */
+pumped[D: Driver, P: Pump](inner: &D, pump: &P) -> &Pumped[D, P] =
+    Pumped(inner, pump, Watch(-1, -1, -1, -1, -1, Atomic(0), () -> ()), None, false, None, None)
+
+impl[D: Driver, P: Pump] Driver for Pumped[D, P]
+    now(*self) -> Duration = self.inner.now()
+
+    idle_until(*self, deadline: Option[Duration])
+        if !self.pump.active()
+            self.inner.idle_until(deadline)
+            return
+
+        if signalled() then return
+
+        self.arm()
+
+        val now = self.inner.now()
+        val mine = deadline match
+            Some(d) -> Some(if d > now then d - now else micros(0))
+            None -> None
+
+        val theirs = self.inner.backend_timeout()
+
+        // Nothing can end the wait when work without a descriptor completes, so it is sliced.
+        val cap = if self.inner.busy() && self.inner.backend_fd().is_none() then Some(busy_slice) else None
+
+        self.pump.wait(nearer(nearer(mine, theirs), cap))
+        self.inner.poll()
+
+        if self.watch.fired.swap(0) != 0 then self.armed = false
+    end idle_until
+
+    override busy(*self) -> bool = self.inner.busy() || self.pump.busy()
+
+    override poll(*self)
+        self.inner.poll()
+
+        if self.pump.active() then self.pump.poll()
+
+    override waker(*self) -> &sync Fn() -> unit = self.wake_both()
+
+    override quiet(*self) -> bool = self.inner.quiet()
+end Pumped[D, P]
+
+impl[D: Driver, P: Pump] Drop for Pumped[D, P]
+    drop(self)
+        self.watcher match
+            Some(t) ->
+                self.watch.stop()
+                t.join()
+                self.watch.close()
+            None -> ()
+
+private nearer(a: Option[Duration], b: Option[Duration]) -> Option[Duration] = (a, b) match
+    (Some(x), Some(y)) -> Some(if x < y then x else y)
+    (Some(x), None) -> Some(x)
+    (None, y) -> y
+
+/** How many watcher threads are running, in the whole process: what a test reads to see a dropped
+ * driver leave none behind.
+ */
+private[pump] var watchers: Atomic[u32] = Atomic(0)
+
+// The watcher's whole state, shared with its thread: four descriptors, two flags and the pump's
+// waker. The loop's thread writes the gate and reads `fired`; the watcher reads the gate, polls, sets
+// `fired` and wakes the pump.
+private[pump] struct Watch
+    backend: i32
+    gate_in: i32
+    gate_out: i32
+    control_in: i32
+    control_out: i32
+    fired: Atomic[u32]
+    wake: &sync Fn() -> unit
+
+    // Take the descriptor and the waker, and make the two pipes; false where a pipe cannot be made.
+    open(*self, backend: i32, wake: &sync Fn() -> unit) -> bool
+        var gate: [2]i32 = [-1, -1]
+        var control: [2]i32 = [-1, -1]
+
+        if os_pipe(as_mut_ptr(gate)) != 0 then return false
+
+        if os_pipe(as_mut_ptr(control)) != 0
+            os_close(gate[0])
+            os_close(gate[1])
+            return false
+
+        self.backend = backend
+        self.gate_in = gate[0]
+        self.gate_out = gate[1]
+        self.control_in = control[0]
+        self.control_out = control[1]
+        self.wake = wake
+        true
+    end open
+
+    // Let the watcher poll once more.
+    open_gate(self)
+        poke(self.gate_out)
+
+    // Ask the watcher to return, wherever it is. The control byte ends a poll in progress, or the
+    // next one at once; the gate byte lets a watcher waiting at the gate get to that poll.
+    stop(self)
+        poke(self.control_out)
+        poke(self.gate_out)
+
+    close(self)
+        os_close(self.gate_in)
+        os_close(self.gate_out)
+        os_close(self.control_in)
+        os_close(self.control_out)
+end Watch
+
+// The watcher thread. The gate is what keeps it from spinning: the backend descriptor stays readable
+// until the loop's thread takes the events in, and the watcher polls again only once the loop has
+// seen `fired` and reopened the gate. The descriptor is level-triggered from here, so an event that
+// arrived before the poll ends it at once, and nothing is lost.
+private watch_body(w: *Watch) -> unit
+    watchers.add(1)
+    defer watchers.sub(1)
+
+    loop
+        if !take(w.gate_in) then return
+
+        var fds: [2]PollFd =[PollFd(w.backend, poll_in, 0), PollFd(w.control_in, poll_in, 0)]
+
+        // Over two descriptors of its own that stay open until it is joined, the one way the poll
+        // fails is a signal interrupting it, so it polls again.
+        loop
+            if os_poll(as_mut_ptr(fds), 2, -1) > 0 then break
+
+        if fds[1].revents != 0 then return
+
+        w.fired.store(1)
+        (w.wake)()
+end watch_body
+
+// Write one byte, as a wake or a gate opening.
+private poke(fd: i32)
+    var b: u8 = 1
+    os_write(fd, &b, 1)
+
+// Block for one byte; false where every writer has closed the pipe. A read interrupted by a signal is
+// read again.
+private take(fd: i32) -> bool
+    var b: u8 = 0
+
+    loop
+        val n = os_read(fd, &b, 1)
+
+        if n >= 0 then return n == 1
+
+private struct PollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+private const poll_in: i16 = 1
+
+private extern "pipe" os_pipe(fds: *i32) -> i32
+private extern "read" os_read(fd: i32, p: *u8, n: usize) -> isize
+private extern "write" os_write(fd: i32, p: *u8, n: usize) -> isize
+private extern "close" os_close(fd: i32) -> i32
+private extern "poll" os_poll(fds: *PollFd, n: usize, ms: i32) -> i32

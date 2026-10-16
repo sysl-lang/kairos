@@ -4,18 +4,19 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6" }
+//       kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7" }
 //     }
 //
 // The module a program imports is `sh.sysl.kairos`; `sh.sysl.kairos.sim` is the simulated driver
-// the tests run on, `sh.sysl.kairos.host` the real-time one for a laptop, and `sh.sysl.kairos.uv`
-// the libuv one, with sockets and files, behind the `uv` feature:
+// the tests run on, `sh.sysl.kairos.host` the real-time one for a laptop, `sh.sysl.kairos.pump`
+// the driver that waits on another driver and a GUI toolkit's event queue at once, and
+// `sh.sysl.kairos.uv` the libuv one, with sockets and files, behind the `uv` feature:
 //
-//     kairos { git = "github.com/sysl-lang/kairos", version = "0.1.6", features = [uv] }
+//     kairos { git = "github.com/sysl-lang/kairos", version = "0.1.7", features = [uv] }
 
 package {
   name    = "kairos"
-  version = "0.1.6"
+  version = "0.1.7"
   sysl    = "0.1.0-alpha.13"
 }
 
@@ -25,8 +26,9 @@ package {
 // storage and nothing else.
 //
 // **What is NOT here is `os` or `posix`.** The core reads no clock of its own: a `Driver` supplies
-// time and sleep. `sh.sysl.kairos.host` is the one module that asks the operating system for either,
-// and it carries `@requires(posix)` on itself, so a board that never imports it never asks.
+// time and sleep. `sh.sysl.kairos.host` and `sh.sysl.kairos.pump` are the modules that ask the
+// operating system for anything -- a clock, a sleep, a thread, a pipe -- and each carries
+// `@requires(posix)` on itself, so a board that never imports them never asks.
 requires {
   heap = true
 }

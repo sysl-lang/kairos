@@ -517,6 +517,9 @@ struct Loop[D: Driver]
      * that could wake it is cancelled -- unless a task waits in the background, on a notifier or on
      * the driver, since that wait may yet end: then every parked task is left parked, for a later
      * `run` or `pass`.
+     *
+     * Between passes it polls a busy driver before it waits, as `block_on` does, so what a pass
+     * started is on the driver's descriptor before a wait that does not run the driver itself.
      */
     run(*self)
         self.drive(() -> false)
@@ -630,6 +633,14 @@ struct Loop[D: Driver]
             self.turn()
 
             if self.stopping || done() || !self.alive() then break
+
+            // Flush what the pass started -- a read begun, a socket opened -- onto the driver's
+            // descriptor before the wait, so a wait that does not run the driver itself, a pump's,
+            // sees it. The flush can finish the driver's last work -- a close completing -- and a
+            // wait with nothing left would be for ever.
+            if self.driver.busy()
+                self.driver.poll()
+                if !self.alive() then break
 
             self.wait(None)
 
