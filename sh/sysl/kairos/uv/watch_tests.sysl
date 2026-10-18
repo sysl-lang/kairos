@@ -125,7 +125,15 @@ watch_queues()
     libuv.write_file_sync(dir + "/one", [1]).expect("written")
     lp.block_on(lp.sleep(millis(QUIET))).expect("slept")
 
-    val c = lp.block_on(lp.timeout(millis(5000), w.next())).expect("ran").expect("it arrived").expect("a change")
+    // FSEvents may deliver the directory's own creation, made just before the watch began, after the
+    // watch is up: a change naming the directory itself, ahead of the file. It is a real report, so
+    // the test allows it, and only it, before "one".
+    var c = lp.block_on(lp.timeout(millis(5000), w.next())).expect("ran").expect("it arrived").expect("a change")
+    var early = 0
+
+    while c.filename == Some("sysl-kairos-watch-test-queue") && early < 4
+        early += 1
+        c = lp.block_on(lp.timeout(millis(5000), w.next())).expect("ran").expect("it arrived").expect("a change")
 
     assert_eq(c.filename, Some("one"))
     assert_eq(w.path().expect("a path"), dir)
