@@ -161,7 +161,12 @@ struct Pipe
      * read none as the end of the stream.
      *
      * What crosses is a duplicate of the descriptor: **this side still has its own, and still closes
-     * it** -- after the task has ended, since the descriptor is read as the write goes.
+     * it -- but only once the other end has TAKEN it**, which a reply over the channel says. The task
+     * ends when the descriptor is in the kernel's hands, not the other process's: until it is
+     * received it is in flight, and an in-flight socket whose last open copy is closed can be
+     * destroyed by the kernel's collector for descriptors in flight. macOS does this when another
+     * process triggers a collection at the wrong moment, so a listener closed straight after
+     * `write_handle` reaches the child dead often enough under load.
      */
     write_handle(self, bytes: []const u8, h: Passing) -> Task[Result[unit, Error]]
         val ch = self.channel_end()

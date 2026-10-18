@@ -18,7 +18,9 @@ module sh.sysl.kairos.uv
 //
 // **What crosses is a descriptor, duplicated by the kernel**, so each side has a working handle
 // afterwards and each closes its own. That is how a supervisor spreads one listening socket over its
-// workers, or hands each an accepted connection.
+// workers, or hands each an accepted connection. **The sender closes its copy only once the other
+// end says it has the handle**, never as soon as `write_handle` returns: a descriptor still in flight
+// whose last open copy is closed can be destroyed by the kernel (`write_handle`).
 //
 // **A pending handle is taken in the read that carried it.** libuv keeps it only as long as the read
 // callback runs, so `read_handles` accepts every one there and hands them over with the bytes; a

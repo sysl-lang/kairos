@@ -98,9 +98,11 @@ private async pass_a_connection(io: &Uv) -> string
     val (client, server) = await connected_pair(io)
 
     (await one.write_handle("conn".bytes, PassConnection(server))).expect("sent")
-    server.close()
 
+    // Closed once the other end has it, never while it is in flight (`write_handle`).
     val m = (await two.read_handles()).expect("read")
+
+    server.close()
 
     assert_eq(text(m.bytes), "conn")
     assert_eq(m.handles.len, 1)
@@ -139,9 +141,10 @@ private async pass_a_pipe(io: &Uv) -> string
     val (near, far) = io.socket_pair().expect("a pair")
 
     (await one.write_handle("pipe".bytes, PassPipe(near))).expect("sent")
-    near.close()
 
     val m = (await two.read_handles()).expect("read")
+
+    near.close()
     val got = m.handles[0] match
         PassedPipe(p) -> p
         PassedSocket(_) -> panic("a pipe was sent")
@@ -221,10 +224,11 @@ private async send_and_drop(io: &Uv)
     val l = io.listen(loopback(0)).expect("listening")
 
     (await one.write_handle("x".bytes, PassListener(l))).expect("sent")
-    l.close()
 
     // Taken and never asked for: the socket is closed as the message goes.
     val m = (await two.read_handles()).expect("read")
+
+    l.close()
 
     assert_eq(m.handles.len, 1)
     one.close()
@@ -352,9 +356,11 @@ private async parent_side(io: &Uv, lp: &Loop[Uv]) -> string
 
     (await ch.write_handle("listen".bytes, PassListener(l))).expect("sent")
 
-    // Only the child listens from here on, so a connection accepted at all was accepted there.
-    l.close()
+    // The parent's copy is closed only once the child says it has its own: until then the listener
+    // is in flight, and closing it there lets the kernel destroy it (`write_handle`). Only the child
+    // listens from here on, so a connection accepted at all was accepted there.
     assert_eq(text((await ch.read()).expect("read")), "ready")
+    l.close()
 
     val client = (await io.connect(loopback(port))).expect("connected to the child")
 
