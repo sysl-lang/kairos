@@ -191,6 +191,13 @@ struct Pipe
         Terminal(_) -> None
 end Pipe
 
+// A stream is an opaque live resource, not the backend's handle storage. In particular,
+// diagnostic formatting must not walk libuv's self references or its private handle enum.
+impl Debug for Pipe
+    debug(self, out: *Writer, fmt: FormatSpec)
+        val kind = if self.is_terminal() then "Pipe(terminal)" else "Pipe(pipe)"
+        kind.display(out, fmt)
+
 // Reading, writing, the half-close and the close are `ByteStream`'s, so code over the trait takes a
 // pipe as readily as a connection.
 impl ByteStream for Pipe

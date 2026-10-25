@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.13" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.14" }
 }
 ```
 
@@ -343,7 +343,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.13", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.14", features = [uv] }
 }
 ```
 
@@ -395,6 +395,9 @@ lp.run()
 | `io.signal(signum)`, `io.signals(signum)` | a task ending at the next arrival; a `&Signals` whose `next()` is a task per arrival, and which `background()` stops holding the loop open |
 | `io.work(job)` | a task running a `&sync Fn() -> T` on the thread pool; dropping it takes a job no thread has started off the queue |
 | `io.close()` | close the driver's own libuv handles — its timer and its `uv_async` — so a libuv loop of the program's own (`uv_on(l)`) can then `l.close()`, as an actor's thread does before it ends |
+
+`Pipe` diagnostics are opaque (`Pipe(pipe)` or `Pipe(terminal)`), so logging a stream
+or consumer state does not traverse libuv handle storage.
 
 A failure is libuv's own `Error` (`e.name()` is `ENOENT`, `ECANCELED`, …). `close` on a connection,
 listener, pipe or signal watcher ends a task waiting on it with `ECANCELED`. Closing twice does nothing, and a connection

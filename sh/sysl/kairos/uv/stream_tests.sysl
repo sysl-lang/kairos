@@ -325,4 +325,19 @@ ipv6_only_on_v4()
         Ok(_) -> assert(false, "a v4 address was bound v6-only")
 
     event_loop(io).run()
+
+private struct StreamDiagnostic
+    stream: &Pipe
+
+@test("pipe diagnostics stay opaque directly and inside consumer state")
+private opaque_pipe_diagnostics()
+    val io = uv()
+    val (a, b) = io.socket_pair().unwrap()
+    defer a.close()
+    defer b.close()
+    val diagnostic = StreamDiagnostic(a)
+    assert_eq(s"$a", "Pipe(pipe)")
+    assert_eq(f"${a}%?", "Pipe(pipe)")
+    assert_eq(s"$diagnostic", "StreamDiagnostic(stream: Pipe(pipe))")
+    assert_eq(f"${a}%12?", "  Pipe(pipe)")
 #endif
