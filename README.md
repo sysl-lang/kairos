@@ -9,11 +9,11 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.10" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.13" }
 }
 ```
 
-kairos needs sysl 0.1.0-alpha.11 or later: `brew install sysl-lang/tap/sysl`.
+kairos needs sysl 0.6.0 or later: `brew install sysl-lang/tap/sysl`.
 
 ```sysl
 import sh.sysl.kairos.{event_loop, signal}
@@ -343,7 +343,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.10", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.13", features = [uv] }
 }
 ```
 
@@ -432,7 +432,7 @@ the package has none.
 **The probe is not in this repository**, because it cannot be: `sysl test .` walks every `.sysl`
 under the root, a program's entry file declares no module, and there is no way to tell the walk to
 leave a directory alone (a hidden directory is walked too, and `--lib .` then compiles the probe
-twice). So it is here in full -- a `package.hocon` with `requires { heap = true }` beside one
+twice). So it is here in full -- a `sysl.hocon` with `requires { heap = true }` beside one
 `main.sysl`:
 
 ```sysl
