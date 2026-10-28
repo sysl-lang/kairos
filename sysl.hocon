@@ -4,7 +4,7 @@
 // This is the block a *consumer* writes to reach this package:
 //
 //     dependencies {
-//       kairos { git = "github.com/sysl-lang/kairos", version = "0.1.14" }
+//       kairos { git = "github.com/sysl-lang/kairos", version = "0.1.15" }
 //     }
 //
 // The module a program imports is `sh.sysl.kairos`; `sh.sysl.kairos.sim` is the simulated driver
@@ -12,12 +12,12 @@
 // the driver that waits on another driver and a GUI toolkit's event queue at once, and
 // `sh.sysl.kairos.uv` the libuv one, with sockets and files, behind the `uv` feature:
 //
-//     kairos { git = "github.com/sysl-lang/kairos", version = "0.1.14", features = [uv] }
+//     kairos { git = "github.com/sysl-lang/kairos", version = "0.1.15", features = [uv] }
 
 package {
   name    = "kairos"
-  version = "0.1.14"
-  sysl    = "0.6.0"
+  version = "0.1.15"
+  sysl    = "0.7.7"
 }
 
 // **`heap`, because handlers and timers are closures, a task's frame is on the heap, and the tables
@@ -43,5 +43,5 @@ features {
 }
 
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.17", optional = true }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.18", optional = true }
 }
