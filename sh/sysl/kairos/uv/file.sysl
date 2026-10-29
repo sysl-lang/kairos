@@ -19,7 +19,8 @@ private const chunk_size: usize = 65536
 private[uv] async read_file_on(lp: &libuv.Loop, path: string) -> Result[[]u8, Error]
     val f = (await open_on(lp, path, libuv.O_RDONLY))?
     var open = true
-    defer if open then libuv.close(f, ignore, lp)
+    // Cleanup on the way out: a close that cannot even be queued has nobody left to tell.
+    defer if open then _ = libuv.close(f, ignore, lp)
 
     var out: Buf[u8] = buf()
 
@@ -39,7 +40,8 @@ private[uv] async write_file_on(lp: &libuv.Loop, path: string, bytes: []const u8
     val flags = libuv.O_WRONLY | libuv.O_CREAT | libuv.O_TRUNC
     val f = (await open_on(lp, path, flags))?
     var open = true
-    defer if open then libuv.close(f, ignore, lp)
+    // Cleanup on the way out: a close that cannot even be queued has nobody left to tell.
+    defer if open then _ = libuv.close(f, ignore, lp)
 
     var done: usize = 0
 
@@ -55,7 +57,8 @@ private[uv] async append_file_on(lp: &libuv.Loop, path: string, bytes: []const u
     val flags = libuv.O_WRONLY | libuv.O_CREAT | libuv.O_APPEND
     val f = (await open_on(lp, path, flags))?
     var open = true
-    defer if open then libuv.close(f, ignore, lp)
+    // Cleanup on the way out: a close that cannot even be queued has nobody left to tell.
+    defer if open then _ = libuv.close(f, ignore, lp)
 
     var done: usize = 0
 
@@ -84,7 +87,7 @@ private opened(p: &Pending[Result[libuv.File, Error]], r: Result[libuv.File, Err
         return
 
     r match
-        Ok(f) -> libuv.close(f, ignore, lp)
+        Ok(f) -> _ = libuv.close(f, ignore, lp)   // an abandoned open's file: nobody is left to tell
         Err(_) -> ()
 
 private async read_on(lp: &libuv.Loop, f: libuv.File, length: usize = chunk_size,
@@ -149,7 +152,8 @@ end File
 
 impl Drop for File
     drop(self)
-        if self.open then libuv.close(self.fd, ignore, self.lp)
+        // A destructor cannot report; a close that fails to queue leaves the descriptor to the process.
+        if self.open then _ = libuv.close(self.fd, ignore, self.lp)
 
 private[uv] async open_file_on(lp: &libuv.Loop, path: string, flags: i32, mode: i32) -> Result[&File, Error]
     val p: &Pending[Result[libuv.File, Error]] = pending()

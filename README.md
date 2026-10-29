@@ -9,7 +9,7 @@ timers and wait on its sources.
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.15" }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.16" }
 }
 ```
 
@@ -343,7 +343,7 @@ module is empty and nothing of libuv is fetched or linked, so a board's link lin
 
 ```hocon
 dependencies {
-  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.15", features = [uv] }
+  kairos { git = "github.com/sysl-lang/kairos", version = "0.1.16", features = [uv] }
 }
 ```
 

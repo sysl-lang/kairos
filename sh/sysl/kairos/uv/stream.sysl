@@ -71,7 +71,7 @@ private[uv] async read_stream[S: Stream](s: &S, r: &Reader) -> Result[[]u8, Erro
     val p: &Pending[Result[[]u8, Error]] = pending()
 
     s.read_start((got) ->
-        s.read_stop()
+        _ = s.read_stop()   // already delivered: a stop that fails changes nothing the task reports
         p.finish(got match
             libuv.Data(bytes) -> Ok(copy_of(bytes))
             libuv.End -> Ok([0; 0])
@@ -85,7 +85,7 @@ end read_stream
 
 private[uv] stop_reading[S: Stream](s: &S, r: &Reader)
     r.reading = None
-    if !s.is_closing() then s.read_stop()
+    if !s.is_closing() then _ = s.read_stop()   // abandoning a read: there is no one to report to
 
 // **A write and a shutdown are issued at the call, and the task only reports how they ended.** libuv
 // queues them in the order they were issued, so `write(a)`, `write(b)`, `shutdown()` from one turn go

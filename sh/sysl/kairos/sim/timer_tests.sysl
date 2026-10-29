@@ -65,7 +65,7 @@ background_fires_while_kept_timer_holds()
 end background_fires_while_kept_timer_holds
 
 private async wait_source(lp: &Loop[Sim], n: u32, log: &Buf[long])
-    await lp.wait_for(n)
+    (await lp.wait_for(n)).expect("the source is free")
     log.push(whole_micros(lp.now()) / 1000)
 
 @test("a background timer fires while a task waiting on a source holds the loop, and run ends with it")

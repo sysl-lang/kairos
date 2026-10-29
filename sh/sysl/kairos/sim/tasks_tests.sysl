@@ -158,7 +158,7 @@ await_a_taken_source()
     val lp = event_loop(s)
     val log: &Buf[string] = buf()
 
-    lp.on(4, (l) -> ())
+    lp.on(4, (l) -> ()).expect("source 4 is free")
     lp.spawn(on_source(lp, log, 4))
     lp.after(millis(1), (l) -> l.off(4))
     lp.run()

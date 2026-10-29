@@ -130,7 +130,7 @@ private[uv] async read_handles_on(ch: Option[&libuv.Pipe], r: &Reader) -> Result
     val handles: Buf[Passed] = buf()
 
     s.read_start((got) ->
-        s.read_stop()
+        _ = s.read_stop()   // already delivered: a stop that fails changes nothing the task reports
         p.finish(got match
             libuv.Data(bytes) -> take_pending(s, handles) match
                 Ok(_) -> Ok(copy_of(bytes))
