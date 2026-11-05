@@ -154,10 +154,10 @@ private[uv] merged_env(env: []const string, add: []const string) -> Buf[string]
         var at: Option[usize] = None
 
         for i in 0..<out.len()
-            if name_of(out.at(i)) == name then at = Some(i)
+            if name_of(out[i]) == name then at = Some(i)
 
         at match
-            Some(i) -> out.set(i, a)
+            Some(i) -> out[i] = a
             None -> out.push(a)
 
     out

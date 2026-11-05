@@ -40,7 +40,7 @@ private bits_for(s: &Seen, name: string) -> i32
     var all: i32 = 0
 
     for i in 0..<s.names.len()
-        if s.names.at(i) == name then all |= s.bits.at(i)
+        if s.names[i] == name then all |= s.bits[i]
 
     all
 
