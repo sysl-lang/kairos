@@ -31,7 +31,7 @@ struct Sim
         self.clock = self.clock + d
 
     /** The deadline of every `idle_until` call so far, in order. */
-    waits(self) -> []Option[Duration] = self.calls.view()
+    waits(self) -> []const Option[Duration] = self.calls.view()
 
     /** Interrupts scheduled and not yet delivered. */
     queued(self) -> usize = self.irqs.len()

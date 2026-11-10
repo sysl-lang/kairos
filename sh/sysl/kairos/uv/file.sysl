@@ -33,7 +33,7 @@ private[uv] async read_file_on(lp: &libuv.Loop, path: string) -> Result[[]u8, Er
 
     open = false
     (await close_on(lp, f))?
-    Ok(out.view())
+    Ok(out.into_view())
 end read_file_on
 
 private[uv] async write_file_on(lp: &libuv.Loop, path: string, bytes: []const u8) -> Result[unit, Error]
@@ -213,7 +213,7 @@ private[uv] async scandir_on(lp: &libuv.Loop, path: string) -> Result[[]libuv.Di
 
 // The calls that answer nothing but whether they worked: each starts its request with the callback
 // it is handed, and this awaits it.
-private async done_on(start: &Fn(&Fn(Result[unit, Error]) -> unit) -> Result[unit, Error]) -> Result[unit, Error]
+private async done_on(start: &Fn(@keeps &Fn(Result[unit, Error]) -> unit) -> Result[unit, Error]) -> Result[unit, Error]
     val p: &Pending[Result[unit, Error]] = pending()
 
     start((r) -> p.finish(r))?

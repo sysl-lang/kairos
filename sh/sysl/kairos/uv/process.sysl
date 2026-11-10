@@ -123,7 +123,7 @@ private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: [
     for i in 0..<extra.len do pipes.push(slot(lp, extra[i], i32(i + 3), both, slots)?)
 
     val child = libuv.spawn(file, args, ignore_exit, slots.view(), cwd, env, 0, lp)?
-    var p: &Process = Process(child, None, None, pipes.view())
+    var p: &Process = Process(child, None, None, pipes.into_view())
 
     // Weak, or the handle -- which the loop holds until it is closed -- would hold the process, and a
     // process nobody holds any more would never go. Once it has, the exit closes the handle alone.

@@ -143,7 +143,7 @@ private[uv] async read_handles_on(ch: Option[&libuv.Pipe], r: &Reader) -> Result
 
     val got = await settled(p)
 
-    Ok(Message(got?, handles.view()))
+    Ok(Message(got?, handles.into_view()))
 end read_handles_on
 
 // Every handle pending on `ch`, accepted into one of ours. **A kind there is no type for here -- a UDP
