@@ -36,7 +36,7 @@ private async read_all[S: ByteStream](s: &S) -> Result[[]u8, Error]
 
         out.extend(got)
 
-    Ok(out.view())
+    Ok(out.into_view())
 
 // One side of a conversation, written once: say `message`, close the writing half, and hear the rest.
 private async converse[S: ByteStream](s: &S, message: string) -> Result[string, Error]

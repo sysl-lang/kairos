@@ -15,7 +15,7 @@ import sh.sysl.kairos.{Loop, event_loop}
 import sh.sysl.kairos.uv.{Listener, Uv, uv}
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_lossy
-import sysl.threads.spawn
+import sysl.threads.scope
 import sysl.time.{Duration, millis}
 import sysl.posix.time.{monotonic, sleep}
 
@@ -167,14 +167,17 @@ uv_remote_through_the_watcher()
     val r = lp.remote(9).expect("in range")
 
     var s = Later(30, -1, 0, () -> r.raise())
+    val ps = &s
     val started = monotonic()
-    val t = spawn(&later, &s).unwrap()
 
-    val got = lp.block_on(lp.timeout(millis(cap_ms), lp.wait_for(9))).expect("ran")
+    scope((sc) ->
+        val t = sc.spawn(() -> later(ps))
 
-    assert(t.join())
-    assert(got.is_some(), "the source was raised")
-    assert(ms_since(started) < 1000)
+        val got = lp.block_on(lp.timeout(millis(cap_ms), lp.wait_for(9))).expect("ran")
+
+        t.join()
+        assert(got.is_some(), "the source was raised")
+        assert(ms_since(started) < 1000))
 end uv_remote_through_the_watcher
 
 @test("over uv with an inactive pump, timers and a TCP echo behave as on uv alone, and the pump is never asked")

@@ -45,7 +45,7 @@ private async drain(p: &Pipe) -> []u8
 
         out.extend(got)
 
-    out.view()
+    out.into_view()
 
 // -- Pipes --------------------------------------------------------------------------------------
 
@@ -370,7 +370,7 @@ private async stream_out(io: &Uv, path: string) -> []u8
         out.extend(got)
 
     (await f.close()).expect("closed")
-    out.view()
+    out.into_view()
 
 @test("an 8 MB file streamed a piece at a time is the file read whole")
 streamed_file()
