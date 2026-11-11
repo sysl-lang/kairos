@@ -116,11 +116,11 @@ private[uv] spawn_on(lp: &libuv.Loop, file: string, args: []const string, env: [
 
     // Each pipe is a `Pipe` from the start, so one that a failed spawn leaves behind is closed as it
     // is dropped.
-    pipes.push(slot(lp, stdin, 0, libuv.READABLE_PIPE, slots)?)
-    pipes.push(slot(lp, stdout, 1, libuv.WRITABLE_PIPE, slots)?)
-    pipes.push(slot(lp, stderr, 2, libuv.WRITABLE_PIPE, slots)?)
+    pipes.push(slot(lp, stdin, 0, libuv.READABLE_PIPE, &slots)?)
+    pipes.push(slot(lp, stdout, 1, libuv.WRITABLE_PIPE, &slots)?)
+    pipes.push(slot(lp, stderr, 2, libuv.WRITABLE_PIPE, &slots)?)
 
-    for i in 0..<extra.len do pipes.push(slot(lp, extra[i], i32(i + 3), both, slots)?)
+    for i in 0..<extra.len do pipes.push(slot(lp, extra[i], i32(i + 3), both, &slots)?)
 
     val child = libuv.spawn(file, args, ignore_exit, slots.view(), cwd, env, 0, lp)?
     var p: &Process = Process(child, None, None, pipes.into_view())
@@ -174,7 +174,7 @@ private ignore_exit(status: i64, signal: i32) -> unit = ()
 
 // One of the child's descriptors. `flags` is the pipe's direction from the child's side; a channel
 // goes both ways wherever it is.
-private slot(lp: &libuv.Loop, s: Stdio, fd: i32, flags: i32, slots: Buf[libuv.Stdio]) -> Result[Option[&Pipe], Error]
+private slot(lp: &libuv.Loop, s: Stdio, fd: i32, flags: i32, slots: *Buf[libuv.Stdio]) -> Result[Option[&Pipe], Error]
     s match
         Inherit ->
             slots.push(libuv.InheritFd(fd))

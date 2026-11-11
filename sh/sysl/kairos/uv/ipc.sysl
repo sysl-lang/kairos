@@ -127,12 +127,12 @@ private[uv] async read_handles_on(ch: Option[&libuv.Pipe], r: &Reader) -> Result
     val p: &Pending[Result[[]u8, Error]] = pending()
 
     // One buffer under two names: the callback pushes into it, and the message hands it over.
-    val handles: Buf[Passed] = buf()
+    val handles: &Buf[Passed] = buf()
 
     s.read_start((got) ->
         _ = s.read_stop()   // already delivered: a stop that fails changes nothing the task reports
         p.finish(got match
-            libuv.Data(bytes) -> take_pending(s, handles) match
+            libuv.Data(bytes) -> take_pending(s, &*handles) match
                 Ok(_) -> Ok(copy_of(bytes))
                 Err(e) -> Err(e)
             libuv.End -> Ok([0; 0])
@@ -149,7 +149,7 @@ end read_handles_on
 // Every handle pending on `ch`, accepted into one of ours. **A kind there is no type for here -- a UDP
 // socket from some other program -- is accepted and closed**, since one left pending would hold up
 // every handle behind it.
-private take_pending(ch: &libuv.Pipe, into: Buf[Passed]) -> Result[unit, Error]
+private take_pending(ch: &libuv.Pipe, into: *Buf[Passed]) -> Result[unit, Error]
     while ch.pending_count() > 0
         val kind = ch.pending_type()
 
