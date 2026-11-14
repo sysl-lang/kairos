@@ -18,8 +18,11 @@ import sh.sysl.libuv
 import sh.sysl.libuv.Handle
 
 // Where a job leaves its answer for the loop's thread to take.
+// Safe to share: the one pool thread writes `value` once, and the loop's thread reads it only after
+// libuv has delivered the completion, which happens after the job ends.
+@unchecked(Share)
 private struct Slot[T]
-    value: Option[T]
+    private value: Option[T]
 
 private[uv] async work_on[T](lp: &libuv.Loop, job: &sync Fn() -> T) -> Result[T, Error]
     val slot: &sync Slot[T] = Slot(None)
